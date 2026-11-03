@@ -1,0 +1,19 @@
+name: supertimeline_creator
+services:
+  supertimeline:
+    build: .
+    image: supertimeline-creator:local
+    user: "${RUN_USER:-1000:1000}"
+    cpus: "${SUPERTIMELINE_CPUS:-8}"
+    mem_limit: "${SUPERTIMELINE_MEMORY:-14g}"
+    working_dir: /tmp
+    environment:
+      HOME: /tmp
+    volumes:
+      - type: bind
+        source: ${INPUT_DIR:?Set INPUT_DIR}
+        target: /input
+        read_only: true
+      - type: bind
+        source: ${OUTPUT_DIR:?Set OUTPUT_DIR}
+        target: /output

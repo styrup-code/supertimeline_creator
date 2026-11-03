@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!runner.py
+!vhdx_reader.py
+!disk_reader.py
+!patch_plaso.py
+!timeline_noise.txt
+!event_logs.txt
+!event_ids.txt

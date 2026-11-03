@@ -1,0 +1,14 @@
+\(\$FILE\_NAME\)
+\/WinSxS\/
+\/assembly\/
+odlsent
+\.odl
+Cache_Data
+Code\ Cache
+Service\ Worker
+\/Packages\/
+\/windowsapps\/microsoft\/
+\/Program Files\/WindowsApps\/
+SystemApps
+\/Microsoft\ Office\/
+\/Acrobat\ Reader\ DC\/

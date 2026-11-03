@@ -1,0 +1,12 @@
+APPLICATION.evtx
+SYSTEM.evtx
+SECURITY.evtx
+Microsoft-Windows-PowerShell%4Operational.evtx
+Microsoft-Windows-WMI-Activity%4Operational.evtx
+Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational.evtx
+Microsoft-Windows-TaskScheduler%4Operational.evtx
+Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational.evtx
+Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx
+Microsoft-Windows-Windows Defender%4Operational.evtx
+Microsoft-Windows-Sysmon%4Operational.evtx

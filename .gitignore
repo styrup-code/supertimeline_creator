@@ -1,0 +1,28 @@
+# Allowlist project files. Everything else, including evidence and output, is
+# ignored by default. Add new source files deliberately when needed.
+/*
+!/.gitignore
+!/.dockerignore
+!/Dockerfile
+!/docker-compose.yml
+!/README.md
+!/LICENSE
+!/KNOWN_ISSUES.md
+!/VERIFICATION.md
+!/run.py
+!/runner.py
+!/vhdx_reader.py
+!/disk_reader.py
+!/patch_plaso.py
+!/timeline_noise.txt
+!/event_logs.txt
+!/event_ids.txt
+!/tests/
+/tests/*
+!/tests/test_runner.py
+!/tests/test_vhdx_reader.py
+!/tests/test_disk_reader.py
+!/tests/test_launcher.py
+!/tests/test_patch_plaso.py
+!/tests/check_plaso_patch.py
+!/tests/inspect_output.py
