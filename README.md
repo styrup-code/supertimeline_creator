@@ -14,7 +14,9 @@ be adjusted; review the warning report and [known limitations](KNOWN_ISSUES.md)
 before drawing conclusions.
 
 The image builds a Linux MFTECmd executable from .NET 10 source and combines it
-with Plaso and Sleuth Kit's `mactime` utility.
+with Plaso and Sleuth Kit's `mactime` utility. During the build, APT selects
+the ICU runtime package required by the Linux base image, and MFTECmd is
+checked for successful startup.
 
 This project was **vibe coded** with AI assistance. Review the code, test it
 against your own collections, and check the warning reports before relying on
@@ -32,8 +34,9 @@ Linux-specific tools on the host.
   containers, and Python 3.8 or later on Windows or Linux. The supplied
   MFTECmd build targets `linux-x64`; non-x86-64 hosts require compatible
   emulation and were not tested.
-- Internet access for the image build. Docker Desktop must have sufficient CPU,
-  memory, and disk allocated in its own settings.
+- Internet access for the image build. Each launcher run requests current
+  Dockerfile base images; the build fails if they cannot be fetched. Docker
+  Desktop must have sufficient CPU, memory, and disk allocated in its settings.
 - Sufficient disk space in **both** Docker's Linux filesystem and the output
   folder. ZIP contents, intermediate bodyfiles, and the working Plaso database
   live inside the container. Completed CSVs and databases are copied to the
@@ -64,6 +67,13 @@ Windows PowerShell, with Docker Desktop using Linux containers:
 ```powershell
 py -3 .\run.py --input 'C:\Cases\Input' --output 'C:\Cases\Output' --timezone Europe/Zurich
 ```
+
+On Windows, use local directories for both input and output; UNC paths such as
+`\\server\share\folder` and mapped network drives are not supported by this
+launcher. Docker Desktop has reported problems with bind mounts from [UNC
+paths](https://github.com/docker/for-win/issues/13172) and [mapped SMB
+shares](https://github.com/docker/for-win/issues/14271). Store the input files
+locally before processing and write results to a local output directory.
 
 The input directory is mounted read-only. Different input types can be mixed,
 but every input in one run shares the same timezone, export window and options.

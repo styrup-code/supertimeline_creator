@@ -1,7 +1,9 @@
 name: supertimeline_creator
 services:
   supertimeline:
-    build: .
+    build:
+      context: .
+      pull: true
     image: supertimeline-creator:local
     user: "${RUN_USER:-1000:1000}"
     cpus: "${SUPERTIMELINE_CPUS:-8}"

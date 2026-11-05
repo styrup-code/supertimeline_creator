@@ -6,12 +6,16 @@ RUN git clone https://github.com/EricZimmerman/MFTECmd.git /src && cd /src && gi
 
 FROM log2timeline/plaso:latest
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends --no-remove 7zip libdate-manip-perl libicu78 && \
+RUN apt-get update && \
+    icu_runtime="$(apt-cache depends libicu-dev | awk '$1 == "Depends:" && $2 ~ /^libicu[0-9]+[a-z0-9]*$/ {print $2; exit}')" && \
+    test -n "$icu_runtime" && \
+    apt-get install -y --no-install-recommends --no-remove 7zip libdate-manip-perl "$icu_runtime" && \
     cd /tmp && apt-get download sleuthkit && dpkg-deb -x sleuthkit_*.deb /tmp/sleuthkit && \
     install -m 0755 /tmp/sleuthkit/usr/bin/mactime /usr/local/bin/mactime && \
     rm -rf /tmp/sleuthkit /tmp/sleuthkit_*.deb /var/lib/apt/lists/* && \
     log2timeline.py --version && mactime -V
 COPY --from=mfte-build /publish /opt/mftecmd/
+RUN /opt/mftecmd/MFTECmd --version
 COPY patch_plaso.py /opt/supertimeline/patch_plaso.py
 RUN python3 /opt/supertimeline/patch_plaso.py
 COPY runner.py /opt/supertimeline/runner.py
