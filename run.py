@@ -34,9 +34,9 @@ def container_user():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', required=True, help='Folder containing ZIP, KAPE VHDX, E01 or raw disk images')
+    parser.add_argument('--input', required=True, help='Input folder or an individual .plaso file')
     parser.add_argument('--output', default=os.getcwd(), help='Output folder (default: current directory)')
-    parser.add_argument('--timezone', required=True, help='IANA timezone of the source system')
+    parser.add_argument('--timezone', help='IANA timezone of the source system (required for images)')
     parser.add_argument('--cpus', type=cpu_limit, default='8', help='Maximum container CPUs (default: 8; fractional values allowed)')
     parser.add_argument('--memory', type=memory_limit, default='14g', help='Maximum container memory, e.g. 8g or 512m (default: 14g)')
     parser.add_argument('--image-drive-letter', default='C', type=str.upper, choices=list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'),
@@ -48,8 +48,12 @@ def main():
     args = parser.parse_args()
     source = Path(args.input).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
-    if not source.is_dir():
-        parser.error(f'Input directory does not exist: {source}')
+    input_file = None
+    if source.is_file() and source.suffix.lower() == '.plaso':
+        input_file = source.name
+        source = source.parent
+    elif not source.is_dir():
+        parser.error(f'Input must be an existing directory or .plaso file: {source}')
     if not output.is_dir():
         parser.error(f'Output directory does not exist: {output}')
     env = os.environ.copy()
@@ -57,8 +61,12 @@ def main():
                SUPERTIMELINE_CPUS=args.cpus, SUPERTIMELINE_MEMORY=args.memory)
     env['RUN_USER'] = container_user()
     compose = Path(__file__).resolve().with_name('docker-compose.yml')
-    cmd = ['docker', 'compose', '--project-name', 'supertimeline_creator', '-f', str(compose), 'run', '--build', '--rm', 'supertimeline', '--timezone', args.timezone,
+    cmd = ['docker', 'compose', '--project-name', 'supertimeline_creator', '-f', str(compose), 'run', '--build', '--rm', 'supertimeline',
            '--image-drive-letter', args.image_drive_letter]
+    if args.timezone:
+        cmd.extend(('--timezone', args.timezone))
+    if input_file:
+        cmd.append(f'--input-file={input_file}')
     if args.timewindow:
         cmd.extend(('--timewindow', args.timewindow))
     if args.all_time:

@@ -18,6 +18,91 @@ spec.loader.exec_module(runner)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_plaso_reexport_preserves_database_and_filters_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case.plaso'
+            source.write_bytes(b'original database')
+            output = root / 'output'
+            output.mkdir()
+            window = runner.parse_window('2023-01-01..2023-01-02')
+            header = 'date,time,timezone,MACB,source,sourcetype,type,user,host,short,desc,version,filename,inode,notes,format,extra\n'
+            event = '01/01/2023,00:00:00,UTC,....,EVT,WinEVTX,Creation Time,-,-,event,event,2,Security.evtx,-,-,winevtx,<EventID>4624</EventID>\n'
+            rejected = event.replace('4624', '9999')
+            calls = []
+            def fake_command(*args):
+                calls.append(args)
+                if args[0] == 'pinfo.py':
+                    Path(args[args.index('-w') + 1]).write_text('original Plaso warnings\n')
+                elif args[0] == 'psort.py':
+                    Path(args[args.index('-w') + 1]).write_text(header + event + rejected)
+                else:
+                    self.fail(f'Unexpected ingestion command: {args[0]}')
+            selection = (re.compile('Security.evtx', re.I), frozenset(('4624',)))
+            with mock.patch.object(runner, 'OUTPUT', output), mock.patch.object(runner, 'command', side_effect=fake_command):
+                runner.process(source, None, window, 1, event_filter=selection)
+                with self.assertRaises(FileExistsError):
+                    runner.process(source, None, window, 1, event_filter=selection)
+                runner.process(source, None, None, 1, filters_enabled=False)
+            prefix = 'case-supertimeline-2023-01-01_to_2023-01-02'
+            self.assertEqual((output / (prefix + '.csv')).read_text(), header + event)
+            self.assertEqual((output / 'case-supertimeline-all-time.csv').read_text(), header + event + rejected)
+            self.assertIn('cannot restore excluded events', (output / (prefix + '-plaso-warnings.txt')).read_text())
+            self.assertEqual(source.read_bytes(), b'original database')
+            self.assertFalse((output / 'plaso').exists())
+            psort_calls = [c for c in calls if c[0] == 'psort.py']
+            self.assertIn('--slice', psort_calls[0])
+            self.assertNotIn('--slice', psort_calls[1])
+            self.assertEqual(psort_calls[0][-2], source)
+
+    def test_plaso_selection_and_timezone_requirement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp)
+            (inputs / 'case.plaso').touch()
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                 mock.patch.object(runner, 'process') as process, \
+                 mock.patch('sys.argv', ['runner.py', '--no-filter']):
+                self.assertEqual(runner.main(), 0)
+                self.assertEqual(process.call_args.args[0].name, 'case.plaso')
+                (inputs / 'image.zip').touch()
+                with self.assertRaises(SystemExit):
+                    runner.main()
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                 mock.patch.object(runner, 'process') as process, \
+                 mock.patch('sys.argv', ['runner.py', '--no-filter', '--input-file=case.plaso']):
+                self.assertEqual(runner.main(), 0)
+                self.assertEqual(process.call_args.args[0].name, 'case.plaso')
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                 mock.patch.object(runner, 'process') as process, \
+                 mock.patch('sys.argv', ['runner.py', '--no-filter', '--timezone=UTC']):
+                self.assertEqual(runner.main(), 0)
+                self.assertEqual({call.args[0].name for call in process.call_args_list}, {'case.plaso', 'image.zip'})
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch('sys.argv', ['runner.py', '--input-file=../case.plaso']), \
+                 self.assertRaises(SystemExit):
+                runner.main()
+
+    def test_plaso_export_failure_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case.plaso'
+            source.write_bytes(b'evidence')
+            output = root / 'output'
+            output.mkdir()
+            def fail_psort(*args):
+                if args[0] == 'pinfo.py':
+                    Path(args[args.index('-w') + 1]).write_text('warnings')
+                else:
+                    raise RuntimeError('psort failed')
+            with mock.patch.object(runner, 'OUTPUT', output), mock.patch.object(runner, 'command', side_effect=fail_psort), \
+                 self.assertRaises(RuntimeError):
+                runner.process(source, None, None, 1, filters_enabled=False)
+            self.assertEqual(source.read_bytes(), b'evidence')
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_input_batch_selects_supported_images_and_rejects_colliding_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             inputs = Path(tmp)

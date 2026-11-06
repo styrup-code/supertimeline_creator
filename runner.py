@@ -608,9 +608,63 @@ def publish_outputs(pairs):
         raise
 
 
+def export_name(source, window):
+    """Keep image output names stable and distinguish Plaso re-export windows."""
+    name = source.stem + '-supertimeline'
+    if source.suffix.lower() != '.plaso':
+        return name
+    if window is None:
+        return name + '-all-time'
+    start, end = window
+    if start.time() == dt.time() and end.time() == dt.time():
+        return name + f'-{start:%Y-%m-%d}_to_{end - dt.timedelta(days=1):%Y-%m-%d}'
+    return name + f'-{start:%Y%m%dT%H%M%S%fZ}_to_before_{end:%Y%m%dT%H%M%S%fZ}'
+
+
+def export_csv(storage, work, warning_file, window, filters_enabled, event_filter):
+    """Export and filter a CSV from a Plaso storage file."""
+    csv_path = work / 'timeline.csv'
+    command('psort.py', '--unattended', '--status-view', 'linear', '--status-view-interval', '10', '--output-time-zone', 'UTC', *slice_arguments(window), '-o', 'l2tcsv', '-w', csv_path, storage, make_filter(window))
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        raise ValueError('psort did not create a CSV')
+    if filters_enabled:
+        filtered = work / 'timeline-filtered.csv'
+        total, kept, removed = filter_timeline_csv(csv_path, filtered, event_filter)
+        csv_path.unlink()
+        csv_path = filtered
+        filter_summary = f'CSV event-log filter: {total} input rows; kept {kept} WinEVTX rows; removed {removed} WinEVTX rows'
+    else:
+        filter_summary = 'CSV event-log filter disabled'
+    log(filter_summary)
+    with warning_file.open('a', encoding='utf-8') as report_file:
+        report_file.write('\n\n===== CSV event-log filter =====\n' + filter_summary + '\n')
+    return csv_path
+
+
+def process_plaso(source, window, filters_enabled, event_filter):
+    """Re-export an existing database directly from the read-only input mount."""
+    name = export_name(source, window)
+    output = OUTPUT / (name + '.csv')
+    report = OUTPUT / (name + '-plaso-warnings.txt')
+    for target in (output, report):
+        if target.exists():
+            raise FileExistsError(f'Output already exists: {target}')
+    with tempfile.TemporaryDirectory(prefix='supertimeline-') as temp:
+        work = Path(temp)
+        warning_file = work / 'warnings.txt'
+        create_warning_report(source, source, warning_file,
+                              ['MFT filtering was determined when this database was created; re-export cannot restore excluded events.'], [], [])
+        csv_path = export_csv(source, work, warning_file, window, filters_enabled, event_filter)
+        publish_outputs(((warning_file, report), (csv_path, output)))
+        for target in (output, report):
+            log(f'Created {target}')
+
+
 def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C'):
     if filters_enabled and event_filter is None:
         event_filter = load_event_filter()
+    if archive.suffix.lower() == '.plaso':
+        return process_plaso(archive, window, filters_enabled, event_filter)
     output = OUTPUT / (archive.stem + '-supertimeline.csv')
     report = OUTPUT / (archive.stem + '-plaso-warnings.txt')
     plaso_dir = OUTPUT / 'plaso'
@@ -648,21 +702,7 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
         command('log2timeline.py', *common, '--log-file', log_file, '--timezone', timezone, *parser_options, *partition_options, '--storage-file', storage, source)
         warning_file = work / 'warnings.txt'
         create_warning_report(archive, storage, warning_file, summaries, normalization, logs)
-        csv_path = work / 'timeline.csv'
-        command('psort.py', '--unattended', '--status-view', 'linear', '--status-view-interval', '10', '--output-time-zone', 'UTC', *slice_arguments(window), '-o', 'l2tcsv', '-w', csv_path, storage, make_filter(window))
-        if not csv_path.is_file() or csv_path.stat().st_size == 0:
-            raise ValueError('psort did not create a CSV')
-        if filters_enabled:
-            filtered = work / 'timeline-filtered.csv'
-            total, kept, removed = filter_timeline_csv(csv_path, filtered, event_filter)
-            csv_path.unlink()
-            csv_path = filtered
-            filter_summary = f'CSV event-log filter: {total} input rows; kept {kept} WinEVTX rows; removed {removed} WinEVTX rows'
-        else:
-            filter_summary = 'CSV event-log filter disabled'
-        log(filter_summary)
-        with warning_file.open('a', encoding='utf-8') as report_file:
-            report_file.write('\n\n===== CSV event-log filter =====\n' + filter_summary + '\n')
+        csv_path = export_csv(storage, work, warning_file, window, filters_enabled, event_filter)
         publish_outputs(((storage, plaso_output), (warning_file, report), (csv_path, output)))
         for target in (output, report, plaso_output):
             log(f'Created {target}')
@@ -670,7 +710,8 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--timezone', required=True, help='IANA timezone of timestamps without timezone information')
+    parser.add_argument('--timezone', help='IANA timezone of timestamps without timezone information (required for images)')
+    parser.add_argument('--input-file', help=argparse.SUPPRESS)
     parser.add_argument('--no-filter', '-nofilter', action='store_true', help='Disable MFT noise and CSV event-log filters')
     parser.add_argument('--image-drive-letter', type=str.upper, choices=list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'), default='C',
                         help='Drive letter for NTFS MFT paths from E01/raw images (default: C)')
@@ -678,24 +719,35 @@ def main():
     windows.add_argument('--timewindow', type=parse_window, help='Inclusive UTC dates, YYYY-MM-DD..YYYY-MM-DD')
     windows.add_argument('--all-time', action='store_true', help='Export all timestamps, including undated events')
     args = parser.parse_args()
-    try:
-        ZoneInfo(args.timezone)
-    except (ZoneInfoNotFoundError, ValueError):
-        parser.error(f'Unknown IANA timezone: {args.timezone}')
+    if args.timezone:
+        try:
+            ZoneInfo(args.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            parser.error(f'Unknown IANA timezone: {args.timezone}')
     window = None if args.all_time else (args.timewindow or default_window(dt.datetime.now(dt.timezone.utc)))
     log('Export window: ' + (f'{window[0].isoformat()} <= event time < {window[1].isoformat()} (UTC)' if window else 'all timestamps'))
-    archives = sorted((p for p in INPUT.iterdir() if p.is_file() and p.suffix.lower() in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw')), key=lambda p: p.name)
+    if args.input_file:
+        if Path(args.input_file).name != args.input_file or Path(args.input_file).suffix.lower() != '.plaso':
+            parser.error('Input file must be a .plaso filename within the input directory')
+        source = INPUT / args.input_file
+        if not source.is_file():
+            parser.error(f'Input file does not exist: {source}')
+        archives = [source]
+    else:
+        archives = sorted((p for p in INPUT.iterdir() if p.is_file() and p.suffix.lower() in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw', '.plaso')), key=lambda p: p.name)
     if not archives:
-        parser.error('No supported ZIP, VHDX, E01 or raw image files found in the input folder')
+        parser.error('No supported ZIP, VHDX, E01, raw image or Plaso files found in the input folder')
+    if not args.timezone and any(a.suffix.lower() != '.plaso' for a in archives):
+        parser.error('--timezone is required when processing images')
     try:
         event_filter = None if args.no_filter else load_event_filter()
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    names = [a.stem + '-supertimeline.csv' for a in archives]
+    names = [export_name(a, window) + '.csv' for a in archives]
     if len(names) != len({n.casefold() for n in names}):
         parser.error('Input archive names produce colliding output names')
     cpus, memory, jobs, workers = resource_plan(len(archives))
-    log(f'Automatic resources: {cpus} CPUs, {memory / 1024**3:.1f} GiB; {jobs} concurrent archives, {workers} extraction workers each')
+    log(f'Automatic resources: {cpus} CPUs, {memory / 1024**3:.1f} GiB; {jobs} concurrent inputs, up to {workers} extraction workers per image')
     def run_archive(archive):
         _log_context.archive = archive.name
         try:
@@ -711,7 +763,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         failures = [name for name in pool.map(run_archive, archives) if name is not None]
     if failures:
-        log('Failed archives: ' + ', '.join(failures))
+        log('Failed inputs: ' + ', '.join(failures))
         return 1
     return 0
 

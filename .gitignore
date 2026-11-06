@@ -17,6 +17,10 @@
 !/timeline_noise.txt
 !/event_logs.txt
 !/event_ids.txt
+!/assets/
+/assets/*
+!/assets/supertimeline-icon.png
+!/assets/icon-prompt.md
 !/tests/
 /tests/*
 !/tests/test_runner.py
@@ -26,3 +30,4 @@
 !/tests/test_patch_plaso.py
 !/tests/check_plaso_patch.py
 !/tests/inspect_output.py
+assets/icon-prompt.md

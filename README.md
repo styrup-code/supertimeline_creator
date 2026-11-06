@@ -1,24 +1,29 @@
 # Supertimeline creator
 
+<p align="center">
+  <img src="assets/supertimeline-icon.png" alt="Forensic evidence converging into a timeline inside a magnifying glass" width="220">
+</p>
+
 Supertimeline Creator automates the DFIR workflow of turning triage collections
 and disk images into a supertimeline CSV that can be opened in
 [Timeline Explorer](https://ericzimmerman.github.io/) for
 investigation. It supports KAPE and Velociraptor triage ZIPs, KAPE VHDX
-containers, and E01 or raw disk images.
+containers, and E01 or raw disk images. Existing Plaso databases can also be
+re-exported with a different time window without ingesting the evidence again.
 
 The Docker-based pipeline prepares the evidence, extracts and filters MFT
 data with MFTECmd where available, ingests artifacts with Plaso, and exports
-and filters an `l2tcsv` timeline. It produces a separate CSV, Plaso database
-and warning report for each input. The default export window and filters can
-be adjusted; review the warning report and [known limitations](KNOWN_ISSUES.md)
-before drawing conclusions.
+and filters an `l2tcsv` timeline. For each image it produces a separate CSV,
+Plaso database and warning report; an existing Plaso input produces a new CSV
+and report. The default export window and filters can be adjusted; review the
+warning report and [known limitations](KNOWN_ISSUES.md) before drawing conclusions.
 
 The image builds a Linux MFTECmd executable from .NET 10 source and combines it
 with Plaso and Sleuth Kit's `mactime` utility. During the build, APT selects
 the ICU runtime package required by the Linux base image, and MFTECmd is
 checked for successful startup.
 
-This project was **vibe coded** with AI assistance. Review the code, test it
+This project was created with AI assistance. Review the code, test it
 against your own collections, and check the warning reports before relying on
 the results for an investigation.
 
@@ -27,6 +32,26 @@ launcher, `runner.py` processes the archives inside the Linux container, and
 `patch_plaso.py` applies a guarded Plaso compatibility fix during image build.
 The launcher needs only Python's standard library and does not require Plaso or
 Linux-specific tools on the host.
+
+## Workflow
+
+```mermaid
+flowchart TD
+    A[ZIP, KAPE VHDX, E01 or raw image] --> B[Prepare evidence and locate MFT if available]
+    B --> C[MFTECmd bodyfile and optional noise filter]
+    B --> D[Plaso artifact ingestion]
+    C --> D
+    D --> E[Plaso database]
+    F[Existing Plaso database] --> G[Select UTC time window]
+    E --> G
+    G --> H[Export l2tcsv with psort]
+    H --> I[Optional event-log CSV filter]
+    I --> J[Timeline CSV and warning report]
+    J --> K[Timeline Explorer]
+```
+
+For new evidence, the saved Plaso database is also placed in the output folder.
+Re-exporting reads the existing database and produces a new CSV and report.
 
 ## Requirements
 
@@ -48,13 +73,19 @@ Linux-specific tools on the host.
 1. Start Docker and create an input and an output directory.
 2. Put the images to process directly in the input directory. Supported files
    are KAPE or Velociraptor `.zip`, KAPE `.vhdx`, E01 `.E01`, and raw `.dd`,
-   `.img` or `.raw`. The input directory is **not** scanned recursively.
+   `.img` or `.raw`, and existing `.plaso` databases. The input directory is
+   **not** scanned recursively. Alternatively, pass a single `.plaso` file
+   directly as `--input`.
    For segmented E01 images, keep the first `.E01` and all subsequent segments
    together; they are processed as one image.
 3. From the project directory, run the command for your host below, replacing
    the paths and timezone. Both directories must already exist.
 4. Review the CSV and its warning report in the output directory. A completed
    run can still have parser warnings or coverage limitations.
+
+**The default CSV covers the last three calendar months and applies intentional
+MFT and event-log noise filters.** See [Default filtering](#default-filtering)
+before choosing the settings for your investigation.
 
 Linux:
 
@@ -75,19 +106,95 @@ paths](https://github.com/docker/for-win/issues/13172) and [mapped SMB
 shares](https://github.com/docker/for-win/issues/14271). Store the input files
 locally before processing and write results to a local output directory.
 
-The input directory is mounted read-only. Different input types can be mixed,
-but every input in one run shares the same timezone, export window and options.
-Run separate commands when source systems have different timezones. Use an
+The input directory is mounted read-only. Different input types can be mixed;
+images in one run share the same input timezone, and all inputs share the
+export window and options. Run separate commands when image source systems
+have different timezones. Use an
 IANA timezone name; if the source timezone is unknown, `UTC` is an assumption,
 not proof of the source setting.
+
+To export a new window from an existing Plaso file, for example:
+
+```sh
+python3 run.py --input /path/to/output/plaso/case.plaso --output /path/to/output --timewindow 2023-01-01..2023-01-27
+```
+
+On Windows, use `py -3 .\run.py` and local Windows paths in the same way.
+The output is `case-supertimeline-2023-01-01_to_2023-01-27.csv`, with a
+correspondingly named warning report. Different windows can be exported into
+the same directory; existing files are not overwritten. `--all-time` uses the
+suffix `-all-time`. The default three-month window uses UTC timestamps in the
+output name. Use a completed database that is no longer being written. The
+input database is read-only and is not copied to the output.
+For a single file, the launcher mounts its parent directory read-only and
+selects only that file. A folder may contain several Plaso files or a mix of
+Plaso files and other supported inputs.
+
+A timezone is not needed for Plaso-only input: its timestamps were interpreted
+during ingestion and cannot be changed by re-exporting. The CSV event-log
+filter and EVTX creation-time selection still apply; `--no-filter` disables the
+CSV filter. MFT noise filtering was already applied when the database was
+created, so `--no-filter` cannot recover events excluded at ingestion. The
+new warning report includes warnings recorded in the database, but cannot
+reconstruct separate processing logs or reports from the original run.
+
+### Default filtering
+
+The defaults reduce the volume of records when reviewing multiple triage
+collections. A generated CSV is a selected investigative view of the parsed
+data. The following rules apply unless changed as described below:
+
+| Rule | What is excluded by default | Where it applies | How to change it |
+| --- | --- | --- | --- |
+| Time window | Events outside the rolling three calendar months ending at processing time, plus undated events. | CSV export only; parsed dates remain in the saved database. | Set `--timewindow START..END`, or use `--all-time` to include all dates and undated events. |
+| MFT attribute filter | Bodyfile lines marked `($FILE_NAME)`. | Before ingestion: excluded from both the database and CSV. | Edit [timeline_noise.txt](timeline_noise.txt), or use `--no-filter`. |
+| MFT path noise | Bodyfile lines matching the path/name patterns listed below. | Before ingestion: excluded from both the database and CSV. Other artifact parsers are unaffected by this rule. | Edit [timeline_noise.txt](timeline_noise.txt), or use `--no-filter`. |
+| Event-log selection | WinEVTX rows that do not match **both** a configured log pattern and an allowed Event ID. This step retains all non-WinEVTX rows it receives. | CSV only; parsed events remain in the database. | Edit [event_logs.txt](event_logs.txt) and [event_ids.txt](event_ids.txt), or use `--no-filter`. |
+| EVTX timestamp selection | EVTX event timestamps whose description is not `Creation Time`. This describes the event record, not the `.evtx` file's filesystem creation time. | CSV export only, including with `--no-filter` and `--all-time`. | Fixed pipeline behavior; no launcher switch disables it. |
+
+The default MFT path/name patterns match `WinSxS`, `assembly`, `odlsent`, `.odl`,
+`Cache_Data`, `Code Cache`, `Service Worker`, `Packages`,
+`windowsapps/microsoft`, `Program Files/WindowsApps`, `SystemApps`,
+`Microsoft Office` and `Acrobat Reader DC`. The linked configuration contains
+the exact GNU grep patterns and directory boundaries; matching ignores case
+and normalizes path separators.
+
+The event-log list contains 12 patterns: Application, System, Security,
+PowerShell Operational, WMI-Activity Operational, RemoteDesktopServices-RdpCoreTS
+Operational, TaskScheduler Operational, TerminalServices-LocalSessionManager
+Operational, TerminalServices-RemoteConnectionManager Operational,
+TerminalServices-RDPClient Operational, Windows Defender Operational and Sysmon
+Operational. **Only the 108 IDs in `event_ids.txt` are eligible**, even for these
+logs. For example, Sysmon network connections (ID 3) and registry value sets
+(ID 13) are intentionally excluded. Users can extend the lists to include
+them. Log patterns currently match the whole CSV record; see
+[Event-log CSV filter](#event-log-csv-filter) for matching details.
+
+To include all dates and disable both configurable noise filters:
+
+```sh
+python3 run.py --input /path/to/input --output /path/to/output --timezone Europe/Zurich --all-time --no-filter
+```
+
+The fixed EVTX timestamp selection still applies. `--all-time` alone does not
+disable noise filters, and `--no-filter` alone does not remove the time window.
+When re-exporting an existing database, previously excluded MFT records require
+re-ingestion from the original evidence. Editing the filter files takes effect
+on the next launcher build.
+
+Parser coverage is separate from these filters: triage collections and NTFS
+images use `win7,!filestat`, with a separate MFT bodyfile import. Disabling noise
+filters does not enable additional artifact parsers. See
+[Known issues](KNOWN_ISSUES.md) for registry transaction logs, Jump Lists and
+SRUM/ActivitiesCache preset coverage.
 
 ### Command options
 
 | Option | Required / default | Description |
 | --- | --- | --- |
-| `--input DIRECTORY` | Required | Existing directory containing the input files. Files directly inside it are discovered automatically. |
+| `--input PATH` | Required | Existing input directory or a single `.plaso` file. Supported files directly inside a directory are discovered automatically. |
 | `--output DIRECTORY` | Current working directory | Existing directory for the CSV, warning report and Plaso database for each input. |
-| `--timezone TIMEZONE` | Required | IANA source timezone for timestamps without timezone information, such as `Europe/Zurich` or `UTC`. CSV output is in UTC. |
+| `--timezone TIMEZONE` | Required for image input | IANA source timezone for timestamps without timezone information, such as `Europe/Zurich` or `UTC`. Not needed for Plaso-only input; CSV output is in UTC. |
 | `--timewindow START..END` | Rolling three calendar months ending at the current UTC time | Export an inclusive UTC date range in `YYYY-MM-DD..YYYY-MM-DD` format. Cannot be combined with `--all-time`. |
 | `--all-time` | Off | Export all dates and undated events. Cannot be combined with `--timewindow`. |
 | `--no-filter`, `-nofilter` | Filters enabled | Disable both the MFT bodyfile noise filter and the CSV event-log filter. The time window and Plaso EVTX `Creation Time` selection still apply. |
@@ -158,12 +265,15 @@ For each supported input, the output folder receives:
 - `<name>-plaso-warnings.txt`
 - `plaso/<name>.plaso`
 
+For an existing Plaso input, the output folder receives a window-named CSV and
+warning report instead; the input database remains in its original location.
+
 Existing output files are never intentionally overwritten. Files are copied to
 temporary names on the destination filesystem before publication; incomplete
 copies are not presented as finished output. A failed archive is reported, and
 other archives can still complete; any failure makes the overall exit nonzero.
-Inputs with the same basename, even with different extensions, cannot be
-processed in the same batch because their output names would collide.
+Inputs that produce the same output name cannot be processed in the same batch.
+For example, two images with the same basename but different extensions collide.
 
 After a launcher run, Docker prunes unused dangling images carrying this
 Compose project's label. It does not perform a global image prune.
@@ -314,14 +424,12 @@ Plaso can report extraction and recovery warnings while still producing output;
 review the report for coverage limitations. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
 for limitations and [VERIFICATION.md](VERIFICATION.md) for test coverage.
 
-## Publishing and evidence handling
+## Possible future feature
 
-The included `.gitignore` allows only project source, configuration and
-documentation files by default. Input archives, generated timelines, databases,
-reports, logs and other new files remain ignored. Review changes and staged
-files before sharing: `git add -f` bypasses ignore rules, and evidence may also
-be present in files that are already tracked. Add new project files to the
-allowlist deliberately. Do not publish case data or private reports.
+Registry transaction-log replay before Plaso ingestion is a proposal only;
+it is not implemented or scheduled. The proposed workflow would recover derived
+hives while preserving original evidence and documenting recovery outcomes.
+See the [proposal and validation requirements](KNOWN_ISSUES.md#possible-future-feature-registry-replay-preprocessing).
 
 ## License
 

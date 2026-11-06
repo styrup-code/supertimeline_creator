@@ -12,6 +12,21 @@ spec.loader.exec_module(launcher)
 
 
 class LauncherTests(unittest.TestCase):
+    def test_single_plaso_file_is_selected_without_timezone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case file.plaso'
+            source.touch()
+            args = ['run.py', '--input', str(source), '--output', tmp, '--timewindow', '2023-01-01..2023-01-02']
+            with mock.patch.object(launcher.sys, 'argv', args), \
+                 mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launcher.main(), 0)
+            cmd = run.call_args_list[0].args[0]
+            self.assertIn('--input-file=case file.plaso', cmd)
+            self.assertNotIn('--timezone', cmd)
+            self.assertEqual(run.call_args_list[0].kwargs['env']['INPUT_DIR'], str(root.resolve()))
+
     def test_windows_user_mapping(self):
         with mock.patch.object(launcher.sys, 'platform', 'win32'):
             self.assertEqual(launcher.container_user(), '0:0')
