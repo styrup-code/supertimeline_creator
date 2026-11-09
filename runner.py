@@ -624,6 +624,8 @@ def export_name(source, window):
 def export_csv(storage, work, warning_file, window, filters_enabled, event_filter):
     """Export and filter a CSV from a Plaso storage file."""
     csv_path = work / 'timeline.csv'
+    # psort deduplicates by default. Do not pass --include-all: repeated events
+    # from current/VSS sources should be collapsed in the CSV, not in storage.
     command('psort.py', '--unattended', '--status-view', 'linear', '--status-view-interval', '10', '--output-time-zone', 'UTC', *slice_arguments(window), '-o', 'l2tcsv', '-w', csv_path, storage, make_filter(window))
     if not csv_path.is_file() or csv_path.stat().st_size == 0:
         raise ValueError('psort did not create a CSV')
@@ -637,6 +639,8 @@ def export_csv(storage, work, warning_file, window, filters_enabled, event_filte
         filter_summary = 'CSV event-log filter disabled'
     log(filter_summary)
     with warning_file.open('a', encoding='utf-8') as report_file:
+        report_file.write('\n\n===== CSV deduplication =====\n'
+                          'Enabled using psort default event deduplication; stored events are retained.\n')
         report_file.write('\n\n===== CSV event-log filter =====\n' + filter_summary + '\n')
     return csv_path
 
@@ -660,7 +664,10 @@ def process_plaso(source, window, filters_enabled, event_filter):
             log(f'Created {target}')
 
 
-def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C'):
+def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C', include_vss=False):
+    disk_image = archive.suffix.lower() in ('.e01', '.dd', '.img', '.raw')
+    if include_vss and not disk_image:
+        log('--include-vss applies only to E01/raw disk images; this input uses its existing processing path')
     if filters_enabled and event_filter is None:
         event_filter = load_event_filter()
     if archive.suffix.lower() == '.plaso':
@@ -677,7 +684,6 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
         work = Path(temp)
         evidence = work / 'evidence'
         evidence.mkdir()
-        disk_image = archive.suffix.lower() in ('.e01', '.dd', '.img', '.raw')
         partition, is_ntfs = None, True
         if disk_image:
             from disk_reader import prepare_disk
@@ -697,7 +703,19 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
         parser_options = ['--parsers', 'win7,!filestat'] if is_ntfs else []
         partition_options = ['--partitions', str(partition)] if partition is not None else []
         if disk_image:
-            partition_options.extend(['--vss_stores', 'none'])
+            use_vss = include_vss and is_ntfs
+            partition_options.extend(['--vss_stores', 'all' if use_vss else 'none'])
+            if use_vss:
+                vss_summary = ('VSS: all available snapshots requested on the selected NTFS filesystem; '
+                               'current volume included. CSV events are deduplicated by psort. '
+                               'The MFTECmd bodyfile covers the current volume only; '
+                               'snapshot artifacts use win7,!filestat.')
+            elif include_vss:
+                vss_summary = 'VSS: --include-vss has no effect on the selected non-NTFS filesystem'
+            else:
+                vss_summary = 'VSS: excluded (use --include-vss to include snapshots on NTFS E01/raw images)'
+            log(vss_summary)
+            normalization.append(vss_summary)
         source = archive if disk_image else evidence
         command('log2timeline.py', *common, '--log-file', log_file, '--timezone', timezone, *parser_options, *partition_options, '--storage-file', storage, source)
         warning_file = work / 'warnings.txt'
@@ -713,6 +731,8 @@ def main():
     parser.add_argument('--timezone', help='IANA timezone of timestamps without timezone information (required for images)')
     parser.add_argument('--input-file', help=argparse.SUPPRESS)
     parser.add_argument('--no-filter', '-nofilter', action='store_true', help='Disable MFT noise and CSV event-log filters')
+    parser.add_argument('--include-vss', action='store_true',
+                        help='Include available VSS snapshots in NTFS E01/raw images; CSV events are deduplicated')
     parser.add_argument('--image-drive-letter', type=str.upper, choices=list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'), default='C',
                         help='Drive letter for NTFS MFT paths from E01/raw images (default: C)')
     windows = parser.add_mutually_exclusive_group()
@@ -752,7 +772,8 @@ def main():
         _log_context.archive = archive.name
         try:
             log(f'=== {archive.name} ===')
-            process(archive, args.timezone, window, workers, not args.no_filter, event_filter, args.image_drive_letter)
+            process(archive, args.timezone, window, workers, not args.no_filter, event_filter, args.image_drive_letter,
+                    include_vss=args.include_vss)
         except (OSError, ValueError, RuntimeError, NotImplementedError, csv.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
             log(f'FAILED {archive.name}: {exc}')
             return archive.name

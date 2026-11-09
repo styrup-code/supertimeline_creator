@@ -81,3 +81,14 @@ class LauncherTests(unittest.TestCase):
             with mock.patch.object(launcher.sys, 'argv', args), mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(launcher.main(), 0)
             self.assertIn('--no-filter', run.call_args_list[0].args[0])
+
+    def test_include_vss_is_opt_in_and_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ['run.py', '--input', tmp, '--output', tmp, '--timezone', 'UTC']
+            for enabled in (False, True):
+                with self.subTest(enabled=enabled), \
+                     mock.patch.object(launcher.sys, 'argv', base + (['--include-vss'] if enabled else [])), \
+                     mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(launcher.main(), 0)
+                    self.assertEqual('--include-vss' in run.call_args_list[0].args[0], enabled)

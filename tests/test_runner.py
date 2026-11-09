@@ -43,7 +43,7 @@ class RunnerTests(unittest.TestCase):
                 runner.process(source, None, window, 1, event_filter=selection)
                 with self.assertRaises(FileExistsError):
                     runner.process(source, None, window, 1, event_filter=selection)
-                runner.process(source, None, None, 1, filters_enabled=False)
+                runner.process(source, None, None, 1, filters_enabled=False, include_vss=True)
             prefix = 'case-supertimeline-2023-01-01_to_2023-01-02'
             self.assertEqual((output / (prefix + '.csv')).read_text(), header + event)
             self.assertEqual((output / 'case-supertimeline-all-time.csv').read_text(), header + event + rejected)
@@ -142,7 +142,7 @@ class RunnerTests(unittest.TestCase):
             barrier = threading.Barrier(2)
             found = {}
 
-            def extract(archive, *args):
+            def extract(archive, *args, **kwargs):
                 dest = root / archive.stem
                 dest.mkdir()
                 barrier.wait(timeout=10)
@@ -455,10 +455,11 @@ class RunnerTests(unittest.TestCase):
                     runner.process(archive, 'Europe/Zurich', None, 6, event_filter=selection)
                 unfiltered_archive = root / 'unfiltered.zip'
                 shutil.copyfile(archive, unfiltered_archive)
-                runner.process(unfiltered_archive, 'Europe/Zurich', None, 6, filters_enabled=False)
+                runner.process(unfiltered_archive, 'Europe/Zurich', None, 6, filters_enabled=False, include_vss=True)
             imports = [c for c in calls if c[0] == 'log2timeline.py']
             self.assertEqual([c[c.index('--timezone') + 1] for c in imports], ['UTC', 'Europe/Zurich'] * 2)
             self.assertEqual([c[c.index('--parsers') + 1] for c in imports], ['mactime', 'win7,!filestat'] * 2)
+            self.assertTrue(all('--vss_stores' not in c for c in imports))
             export = next(c for c in calls if c[0] == 'psort.py')
             self.assertIn('--slice', export)
             self.assertEqual(export[export.index('-o') + 1], 'l2tcsv')
@@ -478,6 +479,60 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 runner.publish_outputs(((source, first), (source, root / 'missing' / 'second')))
             self.assertFalse(first.exists())
+
+    def test_vss_selection_preserves_partition_current_volume_and_export_dedup(self):
+        # Exercise the whole runner orchestration while mocking forensic tools.
+        for suffix, is_ntfs, enabled, partition, expected in (
+                ('.E01', True, False, 2, 'none'),
+                ('.E01', True, True, 2, 'all'),
+                ('.raw', True, True, None, 'all'),
+                ('.E01', False, True, 1, 'none')):
+            with self.subTest(suffix=suffix, ntfs=is_ntfs, enabled=enabled), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / ('image' + suffix)
+                source.write_bytes(b'unchanged image')
+                output = root / 'output'
+                output.mkdir()
+                calls = []
+                def fake_command(*args):
+                    calls.append(args)
+                    if args[0] == 'log2timeline.py':
+                        Path(args[args.index('--storage-file') + 1]).write_bytes(b'database')
+                    elif args[0] == 'pinfo.py':
+                        Path(args[args.index('-w') + 1]).write_text('warnings\n')
+                    elif args[0] == 'psort.py':
+                        Path(args[args.index('-w') + 1]).write_text('csv\n')
+                with mock.patch.object(runner, 'OUTPUT', output), \
+                     mock.patch('disk_reader.prepare_disk', return_value=([], [], partition, is_ntfs)), \
+                     mock.patch.object(runner, 'command', side_effect=fake_command):
+                    runner.process(source, 'UTC', None, 2, filters_enabled=False, include_vss=enabled)
+                ingest = next(c for c in calls if c[0] == 'log2timeline.py')
+                self.assertEqual(ingest[ingest.index('--vss_stores') + 1], expected)
+                self.assertNotIn('--vss_only', ingest)
+                self.assertEqual(ingest[-1], source)
+                if partition is None:
+                    self.assertNotIn('--partitions', ingest)
+                else:
+                    self.assertEqual(ingest[ingest.index('--partitions') + 1], str(partition))
+                if is_ntfs:
+                    self.assertEqual(ingest[ingest.index('--parsers') + 1], 'win7,!filestat')
+                export = next(c for c in calls if c[0] == 'psort.py')
+                self.assertFalse({'-a', '--include_all', '--include-all'}.intersection(export))
+                report = (output / 'image-plaso-warnings.txt').read_text()
+                self.assertIn('VSS:', report)
+                self.assertIn('Enabled using psort default event deduplication', report)
+                self.assertEqual(source.read_bytes(), b'unchanged image')
+
+    def test_include_vss_passed_through_batch_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp)
+            (inputs / 'image.E01').touch()
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                 mock.patch.object(runner, 'process') as process, \
+                 mock.patch('sys.argv', ['runner.py', '--timezone', 'UTC', '--no-filter', '--include-vss']):
+                self.assertEqual(runner.main(), 0)
+                self.assertTrue(process.call_args.kwargs['include_vss'])
 
 
 if __name__ == '__main__':

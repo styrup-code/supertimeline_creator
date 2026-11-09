@@ -201,6 +201,7 @@ SRUM/ActivitiesCache preset coverage.
 | `--cpus NUMBER` | `8` | Maximum CPUs for the whole container; positive fractional values such as `2.5` are accepted. |
 | `--memory SIZE` | `14g` | Maximum memory for the whole container; use a positive integer in bytes or with `b`, `k`, `m` or `g`, such as `512m` or `16g`. |
 | `--image-drive-letter LETTER` | `C` | Label NTFS MFT paths from E01 and raw disk images with one letter, for example `D`. This is an assumption, not a detected original drive letter; it does not change ZIP or VHDX drive paths. |
+| `--include-vss` | Off | Include all available VSS snapshots alongside the current filesystem on the selected NTFS partition of E01/raw images. `psort` deduplicates exported events; the database retains parsed events. Does not change ZIP, KAPE VHDX or existing Plaso ingestion. |
 | `-h`, `--help` | — | Show launcher options and exit. |
 
 ### Examples
@@ -222,6 +223,34 @@ Process E01 or raw images and label NTFS MFT paths as drive `D:`:
 ```sh
 python3 run.py --input /path/to/images --output /path/to/output --timezone UTC --image-drive-letter D
 ```
+
+Include VSS artifacts from Windows E01 images (keep all E01 segments together):
+
+```sh
+python3 run.py --input /path/to/e01-images --output /path/to/output --timezone Europe/Zurich --include-vss --all-time
+```
+
+`--include-vss` also supports NTFS raw images. It requests all available stores
+on the already selected partition; it does not select additional partitions.
+The current filesystem is processed too. If there are no available snapshots,
+only the current filesystem contributes events. The normal time window and
+noise filters apply; `--all-time` above includes older snapshot events in the
+CSV. Snapshot creation time is not substituted for artifact event timestamps.
+
+Deduplication uses Plaso's normal `psort` event comparison during CSV export;
+it does not skip identical files before parsing or remove stored events from
+the `.plaso` database. It remains enabled with `--no-filter`. Changed events
+can remain distinct, and a deduplicated CSV does not enumerate every snapshot
+in which a repeated event was found. VSS can substantially increase ingestion
+time and database size. See [Plaso's psort documentation](https://github.com/log2timeline/plaso/blob/main/docs/sources/user/Using-psort.md).
+
+Snapshot artifacts use the same `win7,!filestat` preset. The MFTECmd bodyfile
+still comes from the current volume's MFT; this option does not add historical
+MFT bodyfiles. Non-NTFS disk images and other input types keep their existing
+processing behavior, with a console message when the option does not apply.
+Re-exporting an existing `.plaso` file cannot add snapshots that were never
+ingested. The warning report records the requested VSS mode and CSV
+deduplication policy.
 
 For a range such as `2023-01-01..2023-01-27`, both dates are included in UTC.
 The default rolling window clamps the starting day if the earlier month has
@@ -380,8 +409,10 @@ filtering disabled, the saved database also retains all MFT bodyfile entries.
   on NTFS, the selected filesystem's `$MFT` is also copied to temporary
   storage for MFTECmd and filtered using the same bodyfile rules as triage
   inputs. On other supported filesystems, MFT processing is skipped and Plaso
-  chooses its parsers normally. VSS snapshots are not included for disk images;
-  the selected current filesystem is processed.
+  chooses its parsers normally. VSS snapshots are excluded by default; use
+  `--include-vss` to parse available snapshots of the selected NTFS filesystem
+  alongside its current contents. Snapshot artifacts use the existing preset;
+  the MFTECmd bodyfile still covers only the current volume.
 
   A disk image does not reliably identify its original Windows drive letter.
   NTFS MFT paths use `C:` by default; supply, for example,
