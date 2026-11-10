@@ -3,6 +3,7 @@
 import argparse
 import calendar
 import concurrent.futures
+from contextlib import closing
 import csv
 import datetime as dt
 import errno
@@ -12,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -164,6 +166,42 @@ def filter_timeline_csv(source_path, output_path, event_filter):
         other.seek(0)
         shutil.copyfileobj(other, output, 1024 * 1024)
     return total, kept_events, removed_events
+
+
+def deduplicate_timeline_csv(source_path, output_path, work):
+    """Keep the first row for each exact displayed timestamp and description."""
+    csv.field_size_limit(min(sys.maxsize, 2_147_483_647))
+    total = kept = 0
+    with closing(sqlite3.connect(str(work / 'csv-dedup.sqlite'))) as database:
+        database.execute('PRAGMA journal_mode=OFF')
+        database.execute('PRAGMA synchronous=OFF')
+        database.execute('PRAGMA cache_size=-65536')
+        database.execute('CREATE TABLE seen (date TEXT NOT NULL, time TEXT NOT NULL, '
+                         'timezone TEXT NOT NULL, description TEXT NOT NULL, '
+                         'PRIMARY KEY (date, time, timezone, description)) WITHOUT ROWID')
+        with source_path.open('r', encoding='utf-8-sig', newline='') as source, \
+             output_path.open('w', encoding='utf-8', newline='') as output:
+            reader = csv.reader(source, strict=True)
+            writer = csv.writer(output, lineterminator='\n')
+            header = next(reader, None)
+            required = ('date', 'time', 'timezone', 'desc')
+            if not header or any(header.count(name) != 1 for name in required):
+                raise ValueError('Unexpected supertimeline CSV header for deduplication')
+            indexes = [header.index(name) for name in required]
+            writer.writerow(header)
+            for row in reader:
+                if len(row) != len(header):
+                    raise ValueError(f'Malformed supertimeline CSV record near line {reader.line_num}')
+                total += 1
+                result = database.execute('INSERT OR IGNORE INTO seen VALUES (?, ?, ?, ?)',
+                                          tuple(row[index] for index in indexes))
+                if result.rowcount:
+                    writer.writerow(row)
+                    kept += 1
+                if total % 100000 == 0:
+                    database.commit()
+                    log(f'CSV deduplication: processed {total:,} rows; kept {kept:,}')
+    return total, kept
 
 
 def publish_file(source, destination):
@@ -621,12 +659,11 @@ def export_name(source, window):
     return name + f'-{start:%Y%m%dT%H%M%S%fZ}_to_before_{end:%Y%m%dT%H%M%S%fZ}'
 
 
-def export_csv(storage, work, warning_file, window, filters_enabled, event_filter):
+def export_csv(storage, work, warning_file, window, filters_enabled, event_filter, include_duplicates=False):
     """Export and filter a CSV from a Plaso storage file."""
     csv_path = work / 'timeline.csv'
-    # psort deduplicates by default. Do not pass --include-all: repeated events
-    # from current/VSS sources should be collapsed in the CSV, not in storage.
-    command('psort.py', '--unattended', '--status-view', 'linear', '--status-view-interval', '10', '--output-time-zone', 'UTC', *slice_arguments(window), '-o', 'l2tcsv', '-w', csv_path, storage, make_filter(window))
+    # Request all events before either applying the CSV rule or keeping duplicates.
+    command('psort.py', '--unattended', '--status-view', 'linear', '--status-view-interval', '10', '--output-time-zone', 'UTC', '--include-all', *slice_arguments(window), '-o', 'l2tcsv', '-w', csv_path, storage, make_filter(window))
     if not csv_path.is_file() or csv_path.stat().st_size == 0:
         raise ValueError('psort did not create a CSV')
     if filters_enabled:
@@ -638,14 +675,22 @@ def export_csv(storage, work, warning_file, window, filters_enabled, event_filte
     else:
         filter_summary = 'CSV event-log filter disabled'
     log(filter_summary)
+    if not include_duplicates:
+        deduplicated = work / 'timeline-deduplicated.csv'
+        total, kept = deduplicate_timeline_csv(csv_path, deduplicated, work)
+        csv_path.unlink()
+        csv_path = deduplicated
+        dedup_summary = f'CSV timestamp and long-description deduplication: {total} input rows; kept {kept}; removed {total - kept}'
+    else:
+        dedup_summary = 'CSV timestamp and long-description deduplication disabled by --include-duplicates; psort --include-all requested'
+    log(dedup_summary)
     with warning_file.open('a', encoding='utf-8') as report_file:
-        report_file.write('\n\n===== CSV deduplication =====\n'
-                          'Enabled using psort default event deduplication; stored events are retained.\n')
+        report_file.write('\n\n===== CSV deduplication =====\n' + dedup_summary + '\n')
         report_file.write('\n\n===== CSV event-log filter =====\n' + filter_summary + '\n')
     return csv_path
 
 
-def process_plaso(source, window, filters_enabled, event_filter):
+def process_plaso(source, window, filters_enabled, event_filter, include_duplicates=False):
     """Re-export an existing database directly from the read-only input mount."""
     name = export_name(source, window)
     output = OUTPUT / (name + '.csv')
@@ -658,20 +703,20 @@ def process_plaso(source, window, filters_enabled, event_filter):
         warning_file = work / 'warnings.txt'
         create_warning_report(source, source, warning_file,
                               ['MFT filtering was determined when this database was created; re-export cannot restore excluded events.'], [], [])
-        csv_path = export_csv(source, work, warning_file, window, filters_enabled, event_filter)
+        csv_path = export_csv(source, work, warning_file, window, filters_enabled, event_filter, include_duplicates)
         publish_outputs(((warning_file, report), (csv_path, output)))
         for target in (output, report):
             log(f'Created {target}')
 
 
-def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C', include_vss=False):
+def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C', include_vss=False, include_duplicates=False):
     disk_image = archive.suffix.lower() in ('.e01', '.dd', '.img', '.raw')
     if include_vss and not disk_image:
         log('--include-vss applies only to E01/raw disk images; this input uses its existing processing path')
     if filters_enabled and event_filter is None:
         event_filter = load_event_filter()
     if archive.suffix.lower() == '.plaso':
-        return process_plaso(archive, window, filters_enabled, event_filter)
+        return process_plaso(archive, window, filters_enabled, event_filter, include_duplicates)
     output = OUTPUT / (archive.stem + '-supertimeline.csv')
     report = OUTPUT / (archive.stem + '-plaso-warnings.txt')
     plaso_dir = OUTPUT / 'plaso'
@@ -707,7 +752,7 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
             partition_options.extend(['--vss_stores', 'all' if use_vss else 'none'])
             if use_vss:
                 vss_summary = ('VSS: all available snapshots requested on the selected NTFS filesystem; '
-                               'current volume included. CSV events are deduplicated by psort. '
+                               'current volume included. '
                                'The MFTECmd bodyfile covers the current volume only; '
                                'snapshot artifacts use win7,!filestat.')
             elif include_vss:
@@ -720,7 +765,7 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
         command('log2timeline.py', *common, '--log-file', log_file, '--timezone', timezone, *parser_options, *partition_options, '--storage-file', storage, source)
         warning_file = work / 'warnings.txt'
         create_warning_report(archive, storage, warning_file, summaries, normalization, logs)
-        csv_path = export_csv(storage, work, warning_file, window, filters_enabled, event_filter)
+        csv_path = export_csv(storage, work, warning_file, window, filters_enabled, event_filter, include_duplicates)
         publish_outputs(((storage, plaso_output), (warning_file, report), (csv_path, output)))
         for target in (output, report, plaso_output):
             log(f'Created {target}')
@@ -732,7 +777,9 @@ def main():
     parser.add_argument('--input-file', help=argparse.SUPPRESS)
     parser.add_argument('--no-filter', '-nofilter', action='store_true', help='Disable MFT noise and CSV event-log filters')
     parser.add_argument('--include-vss', action='store_true',
-                        help='Include available VSS snapshots in NTFS E01/raw images; CSV events are deduplicated')
+                        help='Include available VSS snapshots in NTFS E01/raw images')
+    parser.add_argument('--include-duplicates', action='store_true',
+                        help='Include duplicate CSV rows instead of deduplicating by timestamp and long description')
     parser.add_argument('--image-drive-letter', type=str.upper, choices=list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'), default='C',
                         help='Drive letter for NTFS MFT paths from E01/raw images (default: C)')
     windows = parser.add_mutually_exclusive_group()
@@ -773,8 +820,8 @@ def main():
         try:
             log(f'=== {archive.name} ===')
             process(archive, args.timezone, window, workers, not args.no_filter, event_filter, args.image_drive_letter,
-                    include_vss=args.include_vss)
-        except (OSError, ValueError, RuntimeError, NotImplementedError, csv.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
+                    include_vss=args.include_vss, include_duplicates=args.include_duplicates)
+        except (OSError, ValueError, RuntimeError, NotImplementedError, csv.Error, sqlite3.Error, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
             log(f'FAILED {archive.name}: {exc}')
             return archive.name
         finally:

@@ -43,7 +43,9 @@ def main():
                         help='Drive letter used for NTFS MFT paths from E01/raw images (default: C)')
     parser.add_argument('--no-filter', '-nofilter', action='store_true', help='Disable MFT noise and CSV event-log filters')
     parser.add_argument('--include-vss', action='store_true',
-                        help='Include available VSS snapshots in NTFS E01/raw images; CSV events are deduplicated')
+                        help='Include available VSS snapshots in NTFS E01/raw images')
+    parser.add_argument('--include-duplicates', action='store_true',
+                        help='Include duplicate CSV rows instead of deduplicating by timestamp and long description')
     windows = parser.add_mutually_exclusive_group()
     windows.add_argument('--timewindow', help='Inclusive UTC dates: YYYY-MM-DD..YYYY-MM-DD')
     windows.add_argument('--all-time', action='store_true', help='Export all events, including undated ones')
@@ -77,6 +79,8 @@ def main():
         cmd.append('--no-filter')
     if args.include_vss:
         cmd.append('--include-vss')
+    if args.include_duplicates:
+        cmd.append('--include-duplicates')
     started = time.monotonic()
     try:
         try:

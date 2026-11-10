@@ -46,3 +46,35 @@ the output databases passed SQLite integrity checks. A filesystem-only E01 from
 a real collection was also opened read-only and its MFT extracted; that real
 image was not processed end to end. These checks do not establish compatibility
 with every filesystem, encrypted image, E01 segment set or Windows host.
+
+For VSS validation, the upstream [dfVFS `vss.raw` test fixture](https://github.com/log2timeline/dfvfs/blob/main/test_data/vss.raw), containing two
+snapshots, was wrapped in a temporary E01 and processed on Linux with Plaso
+20261027. With `--include-vss`, both stores appeared in the recorded event
+sources; without it, no VSS sources appeared. E01 media and source hashes were
+checked, and the resulting SQLite databases passed integrity checks. This
+fixture did not contain supported artifact events in its snapshots, so it does
+not establish end-to-end artifact coverage for a real Windows E01.
+
+The former experimental VSS event-hash patch has been removed. The optional
+default pass now compares the final CSV's displayed date, time,
+timezone and long description after event-log filtering. Its unit tests cover
+different source paths, quoted multiline descriptions, distinct timestamps and
+descriptions, Plaso re-export and preservation of the original database. This
+comparison is limited by CSV timestamp precision and Plaso's export behavior;
+representative real Windows snapshots remain necessary for wider validation.
+
+A Linux Docker smoke test of the previous opt-in version generated a small
+Plaso database with repeated and historical-only bodyfile events, then
+re-exported it with CSV deduplication enabled.
+The CSV contained two rows from three exported rows, the historical event was
+retained, the warning report recorded the removal, and the database hash was
+unchanged. This synthetic test does not establish coverage or performance for
+a full Windows E01 with snapshots.
+
+The current default and `--include-duplicates` modes were also tested in Docker
+by re-exporting a synthetic existing Plaso file for a one-day UTC window. The
+default produced two rows from three in-window rows, while `--include-duplicates`
+retained all three exported rows. An out-of-window event was excluded in both
+modes, warning reports reflected the selected behavior, and the source database
+hash remained unchanged. Plaso's own MACB grouping and `--include-all` limits
+still apply before either CSV mode.

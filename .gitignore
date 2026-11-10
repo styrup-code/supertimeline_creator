@@ -1,6 +1,8 @@
 # Allowlist project files. Everything else, including evidence and output, is
 # ignored by default. Add new source files deliberately when needed.
 /*
+# Local, standalone CSV cleanup utility; intentionally not committed.
+/deduplicate_timeline.py
 !/.gitignore
 !/.dockerignore
 !/Dockerfile

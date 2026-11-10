@@ -83,8 +83,8 @@ Re-exporting reads the existing database and produces a new CSV and report.
 4. Review the CSV and its warning report in the output directory. A completed
    run can still have parser warnings or coverage limitations.
 
-**The default CSV covers the last three calendar months and applies intentional
-MFT and event-log noise filters.** See [Default filtering](#default-filtering)
+**The default CSV covers the last three calendar months, applies MFT and
+event-log noise filters, and deduplicates matching rows.** See [Default filtering](#default-filtering)
 before choosing the settings for your investigation.
 
 Linux:
@@ -150,6 +150,7 @@ data. The following rules apply unless changed as described below:
 | MFT attribute filter | Bodyfile lines marked `($FILE_NAME)`. | Before ingestion: excluded from both the database and CSV. | Edit [timeline_noise.txt](timeline_noise.txt), or use `--no-filter`. |
 | MFT path noise | Bodyfile lines matching the path/name patterns listed below. | Before ingestion: excluded from both the database and CSV. Other artifact parsers are unaffected by this rule. | Edit [timeline_noise.txt](timeline_noise.txt), or use `--no-filter`. |
 | Event-log selection | WinEVTX rows that do not match **both** a configured log pattern and an allowed Event ID. This step retains all non-WinEVTX rows it receives. | CSV only; parsed events remain in the database. | Edit [event_logs.txt](event_logs.txt) and [event_ids.txt](event_ids.txt), or use `--no-filter`. |
+| CSV deduplication | After event-log filtering, all but the first row with the same displayed date, time, timezone and long description (`desc`). Source path and other fields are not compared. | CSV only; stored events remain in the database. | Use `--include-duplicates` to disable the CSV pass. |
 | EVTX timestamp selection | EVTX event timestamps whose description is not `Creation Time`. This describes the event record, not the `.evtx` file's filesystem creation time. | CSV export only, including with `--no-filter` and `--all-time`. | Fixed pipeline behavior; no launcher switch disables it. |
 
 The default MFT path/name patterns match `WinSxS`, `assembly`, `odlsent`, `.odl`,
@@ -170,17 +171,22 @@ logs. For example, Sysmon network connections (ID 3) and registry value sets
 them. Log patterns currently match the whole CSV record; see
 [Event-log CSV filter](#event-log-csv-filter) for matching details.
 
-To include all dates and disable both configurable noise filters:
+To include all dates, disable both configurable noise filters, and disable the
+CSV deduplication pass:
 
 ```sh
-python3 run.py --input /path/to/input --output /path/to/output --timezone Europe/Zurich --all-time --no-filter
+python3 run.py --input /path/to/input --output /path/to/output --timezone Europe/Zurich --all-time --no-filter --include-duplicates
 ```
 
-The fixed EVTX timestamp selection still applies. `--all-time` alone does not
-disable noise filters, and `--no-filter` alone does not remove the time window.
+The fixed EVTX timestamp selection still applies, and Plaso may group some
+events before CSV filtering. `--all-time` alone does not disable noise filters;
+`--no-filter` alone does not remove the time window or disable deduplication.
 When re-exporting an existing database, previously excluded MFT records require
 re-ingestion from the original evidence. Editing the filter files takes effect
 on the next launcher build.
+
+The previous opt-in `--deduplicate-vss` option has been removed; CSV
+deduplication now runs automatically unless `--include-duplicates` is given.
 
 Parser coverage is separate from these filters: triage collections and NTFS
 images use `win7,!filestat`, with a separate MFT bodyfile import. Disabling noise
@@ -197,11 +203,12 @@ SRUM/ActivitiesCache preset coverage.
 | `--timezone TIMEZONE` | Required for image input | IANA source timezone for timestamps without timezone information, such as `Europe/Zurich` or `UTC`. Not needed for Plaso-only input; CSV output is in UTC. |
 | `--timewindow START..END` | Rolling three calendar months ending at the current UTC time | Export an inclusive UTC date range in `YYYY-MM-DD..YYYY-MM-DD` format. Cannot be combined with `--all-time`. |
 | `--all-time` | Off | Export all dates and undated events. Cannot be combined with `--timewindow`. |
-| `--no-filter`, `-nofilter` | Filters enabled | Disable both the MFT bodyfile noise filter and the CSV event-log filter. The time window and Plaso EVTX `Creation Time` selection still apply. |
+| `--no-filter`, `-nofilter` | Filters enabled | Disable the MFT bodyfile noise filter and CSV event-log filter. The time window, CSV deduplication and Plaso EVTX `Creation Time` selection still apply. |
 | `--cpus NUMBER` | `8` | Maximum CPUs for the whole container; positive fractional values such as `2.5` are accepted. |
 | `--memory SIZE` | `14g` | Maximum memory for the whole container; use a positive integer in bytes or with `b`, `k`, `m` or `g`, such as `512m` or `16g`. |
 | `--image-drive-letter LETTER` | `C` | Label NTFS MFT paths from E01 and raw disk images with one letter, for example `D`. This is an assumption, not a detected original drive letter; it does not change ZIP or VHDX drive paths. |
-| `--include-vss` | Off | Include all available VSS snapshots alongside the current filesystem on the selected NTFS partition of E01/raw images. `psort` deduplicates exported events; the database retains parsed events. Does not change ZIP, KAPE VHDX or existing Plaso ingestion. |
+| `--include-vss` | Off | Include all available VSS snapshots alongside the current filesystem on the selected NTFS partition of E01/raw images. Does not change ZIP, KAPE VHDX or existing Plaso ingestion. |
+| `--include-duplicates` | Off | Disable the default CSV timestamp-and-description deduplication. The runner requests `psort --include-all`; Plaso can still group or omit events before CSV output, as described below. |
 | `-h`, `--help` | — | Show launcher options and exit. |
 
 ### Examples
@@ -212,7 +219,8 @@ Export an inclusive UTC date range while keeping the default filters:
 python3 run.py --input /path/to/input --output /path/to/output --timezone Europe/Zurich --timewindow 2023-01-01..2023-01-27
 ```
 
-Export all dates, disable both filters, and set container limits:
+Export all dates, disable the two noise filters, and set container limits. CSV
+deduplication remains enabled:
 
 ```sh
 python3 run.py --input /path/to/input --output /path/to/output --timezone UTC --all-time --no-filter --cpus 4 --memory 8g
@@ -237,12 +245,49 @@ only the current filesystem contributes events. The normal time window and
 noise filters apply; `--all-time` above includes older snapshot events in the
 CSV. Snapshot creation time is not substituted for artifact event timestamps.
 
-Deduplication uses Plaso's normal `psort` event comparison during CSV export;
-it does not skip identical files before parsing or remove stored events from
-the `.plaso` database. It remains enabled with `--no-filter`. Changed events
-can remain distinct, and a deduplicated CSV does not enumerate every snapshot
-in which a repeated event was found. VSS can substantially increase ingestion
-time and database size. See [Plaso's psort documentation](https://github.com/log2timeline/plaso/blob/main/docs/sources/user/Using-psort.md).
+By default, a separate CSV pass follows the optional event-log filter. It keeps
+the first row with each exact combination of `date`, `time`,
+`timezone` and long description (`desc`). Source path and all other fields are
+ignored, even for non-VSS events. The report records input, kept and removed
+counts. A temporary SQLite index bounds memory use but requires additional
+working disk space; the saved `.plaso` database is not changed. The option can
+also applies when re-exporting an existing `.plaso` file:
+
+```sh
+python3 run.py --input /path/to/case.plaso --output /path/to/output --all-time
+```
+
+To retain duplicate CSV rows produced by Plaso, add `--include-duplicates` to
+either command. This option does not disable the time window, the optional
+event-log filter, or the fixed EVTX timestamp selection; combine it with
+`--all-time --no-filter` when those configurable restrictions are unwanted.
+For example, re-export a specific UTC date range without the CSV deduplication
+pass:
+
+```sh
+python3 run.py --input /path/to/case.plaso --output /path/to/output --timewindow 2023-01-01..2023-01-27 --include-duplicates
+```
+
+The same input and time window produce the same output name in both modes; use
+different output directories to keep both exports because existing files are
+not overwritten.
+
+**This is a triage view, not an exact event identity test.** `l2tcsv` shows
+seconds, so two distinct events within one displayed second with the same long
+description will be collapsed, even if other fields differ. The retained row
+does not list every source where a matching event was observed. Preserve and
+consult the database and original evidence when source provenance or higher
+precision matters.
+
+In both modes, the runner requests `psort --include-all` before its CSV pass.
+Plaso can still group MACB events in `l2tcsv`; in the inspected Plaso
+20261027 code, the last event buffer can also use default deduplication despite
+`--include-all`. Thus the CSV rule applies to rows actually exported by Plaso;
+it cannot restore rows omitted earlier. Consequently, `--include-duplicates`
+retains all rows emitted by Plaso after the selected filters, but does not
+guarantee one CSV row per stored event. See
+[Plaso's psort documentation](https://github.com/log2timeline/plaso/blob/main/docs/sources/user/Using-psort.md).
+VSS can substantially increase ingestion time and database size.
 
 Snapshot artifacts use the same `win7,!filestat` preset. The MFTECmd bodyfile
 still comes from the current volume's MFT; this option does not add historical
@@ -385,8 +430,10 @@ event-log CSV filter:
 python3 run.py --input /path/to/triage-zips --timezone Europe/Zurich --no-filter
 ```
 
-The time window and Plaso's EVTX `Creation Time` condition still apply. With
-filtering disabled, the saved database also retains all MFT bodyfile entries.
+The time window, default CSV deduplication and Plaso's EVTX `Creation Time`
+condition still apply. With filtering disabled, the saved database also
+retains all MFT bodyfile entries. Use `--include-duplicates` to disable the
+separate CSV deduplication pass.
 
 ## Collection layouts and timestamps
 

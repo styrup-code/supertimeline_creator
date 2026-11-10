@@ -4,6 +4,7 @@ import importlib.util
 import json
 import errno
 import shutil
+import sqlite3
 import re
 from unittest import mock
 from pathlib import Path
@@ -43,7 +44,7 @@ class RunnerTests(unittest.TestCase):
                 runner.process(source, None, window, 1, event_filter=selection)
                 with self.assertRaises(FileExistsError):
                     runner.process(source, None, window, 1, event_filter=selection)
-                runner.process(source, None, None, 1, filters_enabled=False, include_vss=True)
+                runner.process(source, None, None, 1, filters_enabled=False, include_vss=True, include_duplicates=True)
             prefix = 'case-supertimeline-2023-01-01_to_2023-01-02'
             self.assertEqual((output / (prefix + '.csv')).read_text(), header + event)
             self.assertEqual((output / 'case-supertimeline-all-time.csv').read_text(), header + event + rejected)
@@ -455,7 +456,7 @@ class RunnerTests(unittest.TestCase):
                     runner.process(archive, 'Europe/Zurich', None, 6, event_filter=selection)
                 unfiltered_archive = root / 'unfiltered.zip'
                 shutil.copyfile(archive, unfiltered_archive)
-                runner.process(unfiltered_archive, 'Europe/Zurich', None, 6, filters_enabled=False, include_vss=True)
+                runner.process(unfiltered_archive, 'Europe/Zurich', None, 6, filters_enabled=False, include_vss=True, include_duplicates=True)
             imports = [c for c in calls if c[0] == 'log2timeline.py']
             self.assertEqual([c[c.index('--timezone') + 1] for c in imports], ['UTC', 'Europe/Zurich'] * 2)
             self.assertEqual([c[c.index('--parsers') + 1] for c in imports], ['mactime', 'win7,!filestat'] * 2)
@@ -501,7 +502,7 @@ class RunnerTests(unittest.TestCase):
                     elif args[0] == 'pinfo.py':
                         Path(args[args.index('-w') + 1]).write_text('warnings\n')
                     elif args[0] == 'psort.py':
-                        Path(args[args.index('-w') + 1]).write_text('csv\n')
+                        Path(args[args.index('-w') + 1]).write_text('date,time,timezone,desc\n')
                 with mock.patch.object(runner, 'OUTPUT', output), \
                      mock.patch('disk_reader.prepare_disk', return_value=([], [], partition, is_ntfs)), \
                      mock.patch.object(runner, 'command', side_effect=fake_command):
@@ -517,10 +518,10 @@ class RunnerTests(unittest.TestCase):
                 if is_ntfs:
                     self.assertEqual(ingest[ingest.index('--parsers') + 1], 'win7,!filestat')
                 export = next(c for c in calls if c[0] == 'psort.py')
-                self.assertFalse({'-a', '--include_all', '--include-all'}.intersection(export))
+                self.assertIn('--include-all', export)
                 report = (output / 'image-plaso-warnings.txt').read_text()
                 self.assertIn('VSS:', report)
-                self.assertIn('Enabled using psort default event deduplication', report)
+                self.assertIn('CSV timestamp and long-description deduplication: 0 input rows', report)
                 self.assertEqual(source.read_bytes(), b'unchanged image')
 
     def test_include_vss_passed_through_batch_cli(self):
@@ -533,6 +534,99 @@ class RunnerTests(unittest.TestCase):
                  mock.patch('sys.argv', ['runner.py', '--timezone', 'UTC', '--no-filter', '--include-vss']):
                 self.assertEqual(runner.main(), 0)
                 self.assertTrue(process.call_args.kwargs['include_vss'])
+
+    def test_csv_vss_deduplication_uses_timestamp_and_long_description(self):
+        header = ['date', 'time', 'timezone', 'desc', 'filename', 'type']
+        rows = [
+            ['01/01/2024', '12:00:00', 'UTC', 'quoted, text\nsecond line', 'current', 'a'],
+            ['01/01/2024', '12:00:00', 'UTC', 'quoted, text\nsecond line', 'vss1', 'b'],
+            ['01/01/2024', '12:00:01', 'UTC', 'quoted, text\nsecond line', 'vss1', 'a'],
+            ['01/01/2024', '12:00:00', 'UTC', 'different', 'vss1', 'a'],
+            ['01/01/2024', '12:00:00', 'CET', 'quoted, text\nsecond line', 'vss1', 'a'],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, output = root / 'source.csv', root / 'output.csv'
+            with source.open('w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f); writer.writerow(header); writer.writerows(rows)
+            total, kept = runner.deduplicate_timeline_csv(source, output, root)
+            with output.open(encoding='utf-8', newline='') as f:
+                self.assertEqual(list(csv.reader(f)), [header, rows[0], rows[2], rows[3], rows[4]])
+            self.assertEqual((total, kept), (5, 4))
+
+    def test_plaso_reexport_uses_csv_dedup_and_requests_all_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case.plaso'
+            source.write_bytes(b'original')
+            output = root / 'out'; output.mkdir()
+            window = runner.parse_window('2024-01-01..2024-01-01')
+            name = 'case-supertimeline-2024-01-01_to_2024-01-01'
+            header = 'date,time,timezone,MACB,source,sourcetype,type,user,host,short,desc,version,filename,inode,notes,format,extra\n'
+            row = '01/01/2024,12:00:00,UTC,....,LOG,Other,Written Time,-,-,short,description,2,live,-,-,parser,-\n'
+            calls = []
+            def fake_command(*args):
+                calls.append(args)
+                if args[0] == 'pinfo.py':
+                    Path(args[args.index('-w') + 1]).write_text('warnings')
+                elif args[0] == 'psort.py':
+                    Path(args[args.index('-w') + 1]).write_text(header + row + row.replace(',live,', ',vss1,'))
+            with mock.patch.object(runner, 'OUTPUT', output), mock.patch.object(runner, 'command', side_effect=fake_command):
+                runner.process(source, None, window, 1, filters_enabled=False)
+            self.assertIn('--include-all', next(c for c in calls if c[0] == 'psort.py'))
+            self.assertEqual((output / (name + '.csv')).read_text(), header + row)
+            self.assertIn('kept 1; removed 1', (output / (name + '-plaso-warnings.txt')).read_text())
+            self.assertEqual(source.read_bytes(), b'original')
+            other_output = root / 'include'; other_output.mkdir()
+            with mock.patch.object(runner, 'OUTPUT', other_output), mock.patch.object(runner, 'command', side_effect=fake_command):
+                runner.process(source, None, window, 1, filters_enabled=False, include_duplicates=True)
+            self.assertEqual((other_output / (name + '.csv')).read_text(),
+                             header + row + row.replace(',live,', ',vss1,'))
+            self.assertIn('disabled by --include-duplicates',
+                          (other_output / (name + '-plaso-warnings.txt')).read_text())
+            self.assertTrue(all('--include-all' in c for c in calls if c[0] == 'psort.py'))
+            self.assertTrue(all('--slice' in c for c in calls if c[0] == 'psort.py'))
+            self.assertEqual(source.read_bytes(), b'original')
+
+    def test_event_filter_runs_before_csv_deduplication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / 'warnings.txt'; report.write_text('warnings')
+            header = 'date,time,timezone,MACB,source,sourcetype,type,user,host,short,desc,version,filename,inode,notes,format,extra\n'
+            row = '01/01/2024,12:00:00,UTC,....,EVT,WinEVTX,Creation Time,-,-,event,description,2,Other.evtx,-,-,winevtx,<EventID>4624</EventID>\n'
+            def fake_command(*args):
+                Path(args[args.index('-w') + 1]).write_text(header + row + row.replace('Other.evtx', 'Security.evtx'))
+            with mock.patch.object(runner, 'command', side_effect=fake_command):
+                result = runner.export_csv(root / 'case.plaso', root, report, None, True,
+                                           (re.compile('Security.evtx', re.I), frozenset({'4624'})))
+            self.assertEqual(result.read_text(), header + row.replace('Other.evtx', 'Security.evtx'))
+            self.assertIn('1 input rows; kept 1; removed 0', report.read_text())
+
+    def test_csv_deduplication_failure_publishes_no_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case.plaso'; source.write_bytes(b'original')
+            output = root / 'out'; output.mkdir()
+            def fake_command(*args):
+                Path(args[args.index('-w') + 1]).write_text('data')
+            with mock.patch.object(runner, 'OUTPUT', output), \
+                 mock.patch.object(runner, 'command', side_effect=fake_command), \
+                 mock.patch.object(runner, 'deduplicate_timeline_csv', side_effect=sqlite3.OperationalError('disk full')), \
+                 self.assertRaises(sqlite3.OperationalError):
+                runner.process(source, None, None, 1, filters_enabled=False)
+            self.assertEqual(list(output.iterdir()), [])
+            self.assertEqual(source.read_bytes(), b'original')
+
+    def test_include_duplicates_flag_passed_through_batch_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp); (inputs / 'case.plaso').touch()
+            with mock.patch.object(runner, 'INPUT', inputs), \
+                 mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                 mock.patch.object(runner, 'process') as process, \
+                 mock.patch('sys.argv', ['runner.py', '--no-filter', '--include-duplicates', '--timewindow', '2024-01-01..2024-01-01']):
+                self.assertEqual(runner.main(), 0)
+                self.assertTrue(process.call_args.kwargs['include_duplicates'])
+                self.assertEqual(process.call_args.args[2], runner.parse_window('2024-01-01..2024-01-01'))
 
 
 if __name__ == '__main__':
