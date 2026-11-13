@@ -6,6 +6,8 @@ import errno
 import shutil
 import sqlite3
 import re
+import os
+import subprocess
 from unittest import mock
 from pathlib import Path
 import tempfile
@@ -156,6 +158,200 @@ class RunnerTests(unittest.TestCase):
                  mock.patch('sys.argv', ['runner.py', '--timezone', 'UTC', '--no-filter']):
                 self.assertEqual(runner.main(), 0)
             self.assertEqual(found, {'kape.zip': ('D', b'kape-mft'), 'velo.zip': ('E', b'velo-mft')})
+
+    def test_extracted_collection_preserves_source_and_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'case'
+            (source / 'C' / 'Windows').mkdir(parents=True)
+            mft = source / 'C' / '$MFT'
+            mft.write_bytes(b'mft')
+            artifact = source / 'C' / 'Windows' / 'artifact'
+            artifact.write_bytes(b'artifact')
+            os.utime(artifact, ns=(1600000000000000000, 1600000000000000000))
+            (source / 'collection.log').write_text('ignored')
+            dest = root / 'staging'
+            dest.mkdir()
+            mfts, _ = runner.extract_evidence(source, dest)
+            self.assertEqual(mfts[0].read_bytes(), b'mft')
+            self.assertEqual((dest / 'C/Windows/artifact').stat().st_mtime_ns, artifact.stat().st_mtime_ns)
+            self.assertFalse((dest / 'collection.log').exists())
+            self.assertEqual(artifact.read_bytes(), b'artifact')
+
+    def test_extracted_velociraptor_restores_metadata_on_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'collection'
+            mft = source / 'uploads' / 'ntfs' / 'C%3A' / '$MFT'
+            mft.parent.mkdir(parents=True)
+            mft.write_bytes(b'mft')
+            original_time = mft.stat().st_mtime_ns
+            (source / 'results').mkdir()
+            metadata = {'SourceFile': 'mft', 'Accessor': 'ntfs', 'Modified': '2020-01-02T03:04:05Z',
+                        'LastAccessed': '2020-01-03T03:04:05Z'}
+            (source / 'results' / 'Windows.Triage.Targets%2FAll_Matches_Metadata.json').write_text(json.dumps(metadata) + '\n')
+            upload = {'vfs_path': 'mft', '_Components': ['uploads', 'ntfs', 'C:', '$MFT'], 'file_size': 3}
+            (source / 'uploads.json').write_text(json.dumps(upload) + '\n')
+            dest = root / 'stage'
+            dest.mkdir()
+            mfts, report = runner.extract_evidence(source, dest)
+            self.assertEqual(mfts[0].stat().st_mtime_ns, runner.iso_timestamp_ns(metadata['Modified']))
+            self.assertEqual(mfts[0].stat().st_atime_ns, runner.iso_timestamp_ns(metadata['LastAccessed']))
+            self.assertEqual(mft.stat().st_mtime_ns, original_time)
+            self.assertIn('restored 1', report[0])
+
+    @unittest.skipUnless(shutil.which('7z'), '7z is required')
+    def test_encrypted_zip_password_prompt_and_source_preservation(self):
+        for encryption in ('AES256', 'ZipCrypto'):
+            with self.subTest(encryption=encryption), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'C').mkdir()
+                (root / 'C' / '$MFT').write_bytes(b'mft')
+                archive = root / 'case.zip'
+                subprocess.run(['7z', 'a', '-tzip', '-mem=' + encryption, '-ptest-secret', str(archive), 'C'],
+                               cwd=root, check=True, stdout=subprocess.DEVNULL)
+                original = archive.read_bytes()
+                dest = root / 'dest'
+                dest.mkdir()
+                with mock.patch.object(runner.sys.stdin, 'isatty', return_value=True), \
+                     mock.patch.object(runner.getpass, 'getpass', return_value='test-secret') as prompt:
+                    mfts, _ = runner.extract_evidence(archive, dest)
+                self.assertEqual(mfts[0].read_bytes(), b'mft')
+                self.assertIn('case.zip', prompt.call_args.args[0])
+                self.assertEqual(archive.read_bytes(), original)
+                with mock.patch.object(runner.sys.stdin, 'isatty', return_value=True), \
+                     mock.patch.object(runner.getpass, 'getpass', return_value='wrong'), \
+                     self.assertRaisesRegex(RuntimeError, 'password may be incorrect'):
+                    runner.extract_evidence(archive, dest)
+                with mock.patch.object(runner.sys.stdin, 'isatty', return_value=False), \
+                     self.assertRaisesRegex(RuntimeError, 'interactive terminal'):
+                    runner.extract_evidence(archive, dest)
+
+    @unittest.skipUnless(shutil.which('7z'), '7z is required')
+    def test_shared_zip_password_and_interactive_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'C').mkdir()
+            (root / 'C' / '$MFT').write_bytes(b'mft')
+            archive = root / 'case.zip'
+            subprocess.run(['7z', 'a', '-tzip', '-mem=AES256', '-pcorrect', str(archive), 'C'],
+                           cwd=root, check=True, stdout=subprocess.DEVNULL)
+            secret = root / 'secret'
+            secret.write_text('correct')
+            with mock.patch.object(runner, 'ZIP_PASSWORD_FILE', secret), \
+                 mock.patch.object(runner.sys.stdin, 'isatty', return_value=False), \
+                 mock.patch.object(runner.getpass, 'getpass') as prompt:
+                for index in range(2):
+                    dest = root / f'out-{index}'
+                    dest.mkdir()
+                    mfts, _ = runner.extract_evidence(archive, dest)
+                    self.assertEqual(mfts[0].read_bytes(), b'mft')
+                prompt.assert_not_called()
+            secret.write_text('incorrect')
+            dest = root / 'fallback'
+            dest.mkdir()
+            with mock.patch.object(runner, 'ZIP_PASSWORD_FILE', secret), \
+                 mock.patch.object(runner.sys.stdin, 'isatty', return_value=True), \
+                 mock.patch.object(runner.getpass, 'getpass', return_value='correct') as prompt:
+                mfts, _ = runner.extract_evidence(archive, dest)
+                self.assertEqual(mfts[0].read_bytes(), b'mft')
+                prompt.assert_called_once()
+            dest = root / 'noninteractive'
+            dest.mkdir()
+            with mock.patch.object(runner, 'ZIP_PASSWORD_FILE', secret), \
+                 mock.patch.object(runner.sys.stdin, 'isatty', return_value=False), \
+                 self.assertRaisesRegex(RuntimeError, 'interactive terminal'):
+                runner.extract_evidence(archive, dest)
+
+    def test_direct_input_and_directory_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'disk.E01').touch()
+            (root / 'other.zip').touch()
+            (root / 'case' / 'C').mkdir(parents=True)
+            for option, name in (('--input-file', 'disk.E01'), ('--input-directory', 'case')):
+                with self.subTest(name=name), mock.patch.object(runner, 'INPUT', root), \
+                     mock.patch.object(runner, 'resource_plan', return_value=(4, 8 * 1024**3, 1, 1)), \
+                     mock.patch.object(runner, 'process') as process, \
+                     mock.patch('sys.argv', ['runner.py', option + '=' + name, '--timezone=UTC', '--no-filter']):
+                    self.assertEqual(runner.main(), 0)
+                    self.assertEqual(process.call_args.args[0], root / name)
+
+    def test_nested_kape_zip_and_directory_preserve_drive_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            (source / 'outer' / 'inner' / 'C' / 'Windows').mkdir(parents=True)
+            (source / 'outer' / 'inner' / 'C' / '$MFT').write_bytes(b'mft')
+            (source / 'outer' / 'inner' / 'C' / 'Windows' / 'artifact').write_bytes(b'artifact')
+            (source / 'outer' / 'inner' / 'D').mkdir()
+            (source / 'outer' / 'inner' / 'D' / '$MFT').write_bytes(b'mft-d')
+            archive = root / 'case.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                for file in source.rglob('*'):
+                    if file.is_file():
+                        z.write(file, file.relative_to(source).as_posix())
+            for evidence in (source, archive):
+                with self.subTest(evidence=evidence), tempfile.TemporaryDirectory(dir=root) as output:
+                    dest = Path(output)
+                    mfts, report = runner.extract_evidence(evidence, dest)
+                    self.assertEqual({runner.drive_letter(path, dest) for path in mfts}, {'C', 'D'})
+                    self.assertEqual((dest / 'C/Windows/artifact').read_bytes(), b'artifact')
+                    self.assertTrue(any('outer/inner' in line for line in report))
+                    self.assertFalse((dest / 'outer').exists())
+
+    def test_nested_velociraptor_zip_uses_metadata_from_same_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / 'nested.zip'
+            metadata = {'SourceFile': 'mft', 'Accessor': 'ntfs', 'Modified': '2020-01-02T03:04:05Z',
+                        'LastAccessed': '2020-01-03T03:04:05Z'}
+            upload = {'vfs_path': 'mft', '_Components': ['uploads', 'ntfs', 'C:', '$MFT'], 'file_size': 3}
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('wrapper/inner/uploads/ntfs/C%3A/$MFT', b'mft')
+                z.writestr('wrapper/inner/uploads.json', json.dumps(upload) + '\n')
+                z.writestr('wrapper/inner/results/Windows.Triage.Targets%2FAll_Matches_Metadata.json', json.dumps(metadata) + '\n')
+            dest = root / 'dest'
+            dest.mkdir()
+            mfts, report = runner.extract_evidence(archive, dest)
+            self.assertEqual(runner.drive_letter(mfts[0], dest), 'C')
+            self.assertEqual(mfts[0].stat().st_mtime_ns, runner.iso_timestamp_ns(metadata['Modified']))
+            self.assertTrue(any('restored 1' in line for line in report))
+
+    def test_multiple_collection_roots_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / 'case.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('host-one/C/$MFT', b'one')
+                z.writestr('host-two/C/$MFT', b'two')
+            dest = root / 'dest'
+            dest.mkdir()
+            with self.assertRaisesRegex(ValueError, 'Multiple collection roots'):
+                runner.extract_evidence(archive, dest)
+            self.assertEqual(list(dest.iterdir()), [])
+
+    @unittest.skipUnless(shutil.which('7z'), '7z is required')
+    def test_nested_encrypted_and_deflate64_zip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'wrapper' / 'C').mkdir(parents=True)
+            (root / 'wrapper' / 'C' / '$MFT').write_bytes(b'mft' * 10000)
+            for method, options in (('encrypted', ['-mem=AES256', '-ptest-secret']),
+                                    ('deflate64', ['-mm=Deflate64'])):
+                archive = root / (method + '.zip')
+                subprocess.run(['7z', 'a', '-tzip', *options, str(archive), 'wrapper'], cwd=root,
+                               check=True, stdout=subprocess.DEVNULL)
+                with zipfile.ZipFile(archive) as z:
+                    if method == 'deflate64':
+                        self.assertIn(9, {i.compress_type for i in z.infolist()})
+                dest = root / (method + '-out')
+                dest.mkdir()
+                with mock.patch.object(runner.sys.stdin, 'isatty', return_value=True), \
+                     mock.patch.object(runner.getpass, 'getpass', return_value='test-secret'):
+                    mfts, _ = runner.extract_evidence(archive, dest)
+                self.assertEqual(mfts[0].relative_to(dest).as_posix(), 'C/$MFT')
+                self.assertEqual(mfts[0].read_bytes(), b'mft' * 10000)
 
     def test_inclusive_date_range_and_bad_dates(self):
         self.assertEqual(runner.parse_window('2023-01-01..2023-01-27'),

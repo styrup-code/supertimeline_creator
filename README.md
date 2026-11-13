@@ -74,8 +74,8 @@ Re-exporting reads the existing database and produces a new CSV and report.
 2. Put the images to process directly in the input directory. Supported files
    are KAPE or Velociraptor `.zip`, KAPE `.vhdx`, E01 `.E01`, and raw `.dd`,
    `.img` or `.raw`, and existing `.plaso` databases. The input directory is
-   **not** scanned recursively. Alternatively, pass a single `.plaso` file
-   directly as `--input`.
+   **not** scanned recursively. Alternatively, pass one supported file or an
+   already extracted triage folder directly as `--input`.
    For segmented E01 images, keep the first `.E01` and all subsequent segments
    together; they are processed as one image.
 3. From the project directory, run the command for your host below, replacing
@@ -105,6 +105,48 @@ launcher. Docker Desktop has reported problems with bind mounts from [UNC
 paths](https://github.com/docker/for-win/issues/13172) and [mapped SMB
 shares](https://github.com/docker/for-win/issues/14271). Store the input files
 locally before processing and write results to a local output directory.
+
+To process an individual image or an already extracted collection:
+
+```sh
+python3 run.py --input /path/to/triage.zip --output /path/to/output --timezone Europe/Zurich
+python3 run.py --input /path/to/disk.E01 --output /path/to/output --timezone Europe/Zurich
+python3 run.py --input /path/to/extracted-triage --output /path/to/output --timezone Europe/Zurich
+```
+
+An extracted KAPE folder must contain drive-letter folders such as `C/` with a
+collected `$MFT`. An extracted Velociraptor collection must retain its `uploads/`,
+`uploads.json`, and `results/` metadata in the original layout. Pass the
+collection folder itself; wrapper folders above the collection root are
+supported for ZIPs and extracted folders. The collection root is identified
+from Velociraptor `uploads/` paths or a KAPE drive-root `$MFT`; multiple
+independent collection roots in one input are rejected rather than combined.
+A directory containing supported image files is otherwise treated as a batch.
+If it contains both drive folders and images, it is treated as an extracted
+collection. Extracted subfolders inside batch folders are not discovered
+automatically. Source files are mounted read-only
+and selected evidence is copied into temporary working storage. Filesystem
+access and modification times are preserved when copying; timestamp quality
+depends on how the folder was originally extracted.
+
+For password-protected ZIP files, the launcher prompts without displaying the
+password. To try the same password across a batch, use:
+
+```sh
+python3 run.py --input /path/to/input --output /path/to/output --timezone UTC --zip-password 'example-password'
+```
+
+**A password supplied on the command line can be exposed in shell history and
+process listings.** The launcher also creates a temporary password file on the
+host, mounts it read-only into the container, and deletes it when the run ends.
+The password is not passed in Docker command arguments or environment variables.
+If the shared password fails for an archive, the runner asks for that archive's
+password in an interactive terminal. Without a working shared password or an
+interactive terminal, that input fails. An incorrect prompted password fails that
+input; rerun to try again. All members of an encrypted ZIP must use the same
+password. The encrypted archive is extracted into temporary container storage
+before the normal collection layout is selected, so allow space for the entire
+decrypted archive as well as working copies.
 
 The input directory is mounted read-only. Different input types can be mixed;
 images in one run share the same input timezone, and all inputs share the
@@ -198,9 +240,10 @@ SRUM/ActivitiesCache preset coverage.
 
 | Option | Required / default | Description |
 | --- | --- | --- |
-| `--input PATH` | Required | Existing input directory or a single `.plaso` file. Supported files directly inside a directory are discovered automatically. |
+| `--input PATH` | Required | Batch directory, extracted KAPE or Velociraptor triage folder, or a single supported ZIP, VHDX, E01, raw or `.plaso` file. Batch discovery is not recursive. |
 | `--output DIRECTORY` | Current working directory | Existing directory for the CSV, warning report and Plaso database for each input. |
 | `--timezone TIMEZONE` | Required for image input | IANA source timezone for timestamps without timezone information, such as `Europe/Zurich` or `UTC`. Not needed for Plaso-only input; CSV output is in UTC. |
+| `--zip-password PASSWORD` | Off | Try a shared password for encrypted ZIPs; prompt if it fails. Command-line passwords can be exposed in shell history and process listings. |
 | `--timewindow START..END` | Rolling three calendar months ending at the current UTC time | Export an inclusive UTC date range in `YYYY-MM-DD..YYYY-MM-DD` format. Cannot be combined with `--all-time`. |
 | `--all-time` | Off | Export all dates and undated events. Cannot be combined with `--timewindow`. |
 | `--no-filter`, `-nofilter` | Filters enabled | Disable the MFT bodyfile noise filter and CSV event-log filter. The time window, CSV deduplication and Plaso EVTX `Creation Time` selection still apply. |

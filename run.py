@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Launch the timeline container from Windows or Linux using Docker Compose."""
 import argparse
+from contextlib import contextmanager
+import json
 import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -32,11 +35,32 @@ def container_user():
     return f'{os.getuid()}:{os.getgid()}'
 
 
+@contextmanager
+def password_override(password):
+    """Mount a temporary password file rather than adding the secret to Docker arguments."""
+    if password is None:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix='supertimeline-password-') as temp:
+        root = Path(temp)
+        secret = root / 'password'
+        secret.write_text(password, encoding='utf-8')
+        if os.name != 'nt':
+            secret.chmod(0o600)
+        override = root / 'compose.json'
+        override.write_text(json.dumps({'services': {'supertimeline': {'volumes': [{
+            'type': 'bind', 'source': str(secret), 'target': '/run/supertimeline-zip-password',
+            'read_only': True
+        }]}}}), encoding='utf-8')
+        yield override
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', required=True, help='Input folder or an individual .plaso file')
+    parser.add_argument('--input', required=True, help='Input folder, extracted triage folder, or a supported image/Plaso file')
     parser.add_argument('--output', default=os.getcwd(), help='Output folder (default: current directory)')
     parser.add_argument('--timezone', help='IANA timezone of the source system (required for images)')
+    parser.add_argument('--zip-password', help='Try this password for encrypted ZIPs (exposed in shell history and process listings)')
     parser.add_argument('--cpus', type=cpu_limit, default='8', help='Maximum container CPUs (default: 8; fractional values allowed)')
     parser.add_argument('--memory', type=memory_limit, default='14g', help='Maximum container memory, e.g. 8g or 512m (default: 14g)')
     parser.add_argument('--image-drive-letter', default='C', type=str.upper, choices=list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'),
@@ -50,14 +74,24 @@ def main():
     windows.add_argument('--timewindow', help='Inclusive UTC dates: YYYY-MM-DD..YYYY-MM-DD')
     windows.add_argument('--all-time', action='store_true', help='Export all events, including undated ones')
     args = parser.parse_args()
+    if args.zip_password is not None and (not args.zip_password or '\n' in args.zip_password or '\r' in args.zip_password):
+        parser.error('--zip-password must be nonempty and cannot contain a newline')
     source = Path(args.input).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     input_file = None
-    if source.is_file() and source.suffix.lower() == '.plaso':
+    input_directory = None
+    if source.is_file() and source.suffix.lower() in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw', '.plaso'):
         input_file = source.name
         source = source.parent
-    elif not source.is_dir():
-        parser.error(f'Input must be an existing directory or .plaso file: {source}')
+    elif source.is_dir():
+        children = list(source.iterdir())
+        is_collection = any(p.is_dir() and (re.fullmatch(r'[A-Za-z]', p.name) or p.name == 'uploads') for p in children)
+        is_batch = any(p.is_file() and p.suffix.lower() in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw', '.plaso') for p in children)
+        if is_collection or (not is_batch and any(p.is_dir() for p in children)):
+            input_directory = source.name
+            source = source.parent
+    else:
+        parser.error(f'Input must be a supported file or an existing directory: {source}')
     if not output.is_dir():
         parser.error(f'Output directory does not exist: {output}')
     env = os.environ.copy()
@@ -71,6 +105,8 @@ def main():
         cmd.extend(('--timezone', args.timezone))
     if input_file:
         cmd.append(f'--input-file={input_file}')
+    if input_directory:
+        cmd.append(f'--input-directory={input_directory}')
     if args.timewindow:
         cmd.extend(('--timewindow', args.timewindow))
     if args.all_time:
@@ -84,7 +120,11 @@ def main():
     started = time.monotonic()
     try:
         try:
-            result = subprocess.run(cmd, env=env).returncode
+            with password_override(args.zip_password) as override:
+                if override is not None:
+                    print('Warning: --zip-password may be exposed in shell history and process listings.', file=sys.stderr, flush=True)
+                    cmd[cmd.index('run'):cmd.index('run')] = ['-f', str(override)]
+                result = subprocess.run(cmd, env=env).returncode
         finally:
             # Use a single project label: Docker combines filters with the
             # same key using OR. This project contains only this service.

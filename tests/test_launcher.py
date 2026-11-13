@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +27,64 @@ class LauncherTests(unittest.TestCase):
             self.assertIn('--input-file=case file.plaso', cmd)
             self.assertNotIn('--timezone', cmd)
             self.assertEqual(run.call_args_list[0].kwargs['env']['INPUT_DIR'], str(root.resolve()))
+
+    def test_direct_supported_files_and_extracted_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ('evidence.zip', 'disk.E01', 'disk.dd', 'image.vhdx'):
+                source = root / name
+                source.touch()
+                with self.subTest(name=name), mock.patch.object(launcher.sys, 'argv', ['run.py', '--input', str(source), '--output', tmp]), \
+                     mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(launcher.main(), 0)
+                    self.assertIn('--input-file=' + name, run.call_args_list[0].args[0])
+                    self.assertEqual(run.call_args_list[0].kwargs['env']['INPUT_DIR'], str(root))
+            source = root / 'extracted.case'
+            (source / 'C').mkdir(parents=True)
+            with mock.patch.object(launcher.sys, 'argv', ['run.py', '--input', str(source), '--output', tmp]), \
+                 mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launcher.main(), 0)
+                self.assertIn('--input-directory=extracted.case', run.call_args_list[0].args[0])
+                self.assertEqual(run.call_args_list[0].kwargs['env']['INPUT_DIR'], str(root))
+
+    def test_nested_extracted_folder_is_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'case'
+            (source / 'wrapper' / 'C').mkdir(parents=True)
+            args = ['run.py', '--input', str(source), '--output', tmp, '--timezone', 'UTC']
+            with mock.patch.object(launcher.sys, 'argv', args), \
+                 mock.patch.object(launcher.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launcher.main(), 0)
+                self.assertIn('--input-directory=case', run.call_args_list[0].args[0])
+
+    def test_zip_password_mounted_temporarily_without_docker_arguments_or_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'test.zip'
+            source.touch()
+            seen = {}
+            def run(cmd, **kwargs):
+                if 'compose' in cmd:
+                    override = Path(cmd[cmd.index('run') - 1])
+                    config = json.loads(override.read_text())
+                    volume = config['services']['supertimeline']['volumes'][0]
+                    secret = Path(volume['source'])
+                    seen.update(override=override, secret=secret, value=secret.read_text(), volume=volume,
+                                cmd=cmd, env=kwargs['env'])
+                return mock.Mock(returncode=0)
+            args = ['run.py', '--input', str(source), '--output', tmp, '--zip-password', 'special secret']
+            with mock.patch.object(launcher.sys, 'argv', args), mock.patch.object(launcher.subprocess, 'run', side_effect=run), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as warning:
+                self.assertEqual(launcher.main(), 0)
+            self.assertEqual(seen['value'], 'special secret')
+            self.assertNotIn('special secret', ' '.join(seen['cmd']))
+            self.assertNotIn('special secret', seen['env'].values())
+            self.assertTrue(seen['volume']['read_only'])
+            self.assertFalse(seen['secret'].exists())
+            self.assertFalse(seen['override'].exists())
+            self.assertIn('shell history', warning.getvalue())
 
     def test_windows_user_mapping(self):
         with mock.patch.object(launcher.sys, 'platform', 'win32'):

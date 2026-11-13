@@ -3,10 +3,12 @@
 import argparse
 import calendar
 import concurrent.futures
+import copy
 from contextlib import closing
 import csv
 import datetime as dt
 import errno
+import getpass
 import json
 import math
 import os
@@ -29,9 +31,11 @@ OUTPUT = Path('/output')
 NOISE = Path('/opt/supertimeline/timeline_noise.txt')
 EVENT_LOGS = Path('/opt/supertimeline/event_logs.txt')
 EVENT_IDS = Path('/opt/supertimeline/event_ids.txt')
+ZIP_PASSWORD_FILE = Path('/run/supertimeline-zip-password')
 VELO_ACCESSORS = frozenset(('auto', 'ntfs', 'file', 'ntfs_vss'))
 _log_context = threading.local()
 _log_lock = threading.Lock()
+_password_lock = threading.Lock()
 
 
 def log(message):
@@ -494,59 +498,201 @@ def restore_sparse_file(path, index_path, label=None):
             stage.unlink(missing_ok=True)
 
 
+class DirectoryArchive:
+    """Read an extracted collection using the ZIP metadata interface."""
+    def __init__(self, root):
+        self.root = root
+        self.entries = []
+        for base, dirs, files in os.walk(root, followlinks=False):
+            for name in dirs + files:
+                path = Path(base) / name
+                if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                    raise ValueError(f'Unsupported extracted collection entry: {path.relative_to(root)}')
+                relative = path.relative_to(root).as_posix() + ('/' if path.is_dir() else '')
+                info = zipfile.ZipInfo(relative)
+                self.entries.append(info)
+
+    def infolist(self):
+        return self.entries
+
+    def namelist(self):
+        return [entry.filename for entry in self.entries]
+
+    def open(self, entry):
+        name = entry.filename if isinstance(entry, zipfile.ZipInfo) else entry
+        return (self.root / name).open('rb')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+def decrypt_archive(archive, dest):
+    """Try the shared password once, then prompt without logging the secret."""
+    def attempt(password):
+        if not password or '\n' in password or '\r' in password:
+            raise ValueError('ZIP password must be nonempty and cannot contain a newline')
+        result = subprocess.run(['7z', 'x', '-y', '-bd', '-bso0', '-bsp0',
+                                 '-o' + str(dest), str(archive)], input=password + '\n',
+                                text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return result.returncode == 0
+
+    if ZIP_PASSWORD_FILE.exists():
+        password = ZIP_PASSWORD_FILE.read_text(encoding='utf-8')
+        if attempt(password):
+            return
+        # A failed extraction may have written partial files; never mix attempts.
+        shutil.rmtree(dest)
+        dest.mkdir()
+        log('Shared ZIP password failed or the archive is damaged; requesting a password')
+    if not sys.stdin.isatty():
+        raise RuntimeError('Encrypted ZIP requires an interactive terminal for its password')
+    with _password_lock:
+        password = getpass.getpass(f'Password for {archive.name}: ')
+        if not attempt(password):
+            raise RuntimeError('Encrypted ZIP extraction failed; password may be incorrect or archive damaged')
+
+
 def extract_evidence(archive, dest):
+    if archive.is_dir():
+        return extract_collection(DirectoryArchive(archive), dest, source_dir=archive)
     with zipfile.ZipFile(archive) as z:
+        # Validate every member before passing an archive to 7-Zip.
         entries = [(info, member_path(info)) for info in z.infolist()]
-        has_velo = any(len(p) >= 3 and p[0] == 'uploads' and p[1] in VELO_ACCESSORS for _, p in entries)
-        if has_velo:
-            selected = [(i, p) for i, p in entries if len(p) >= 3 and p[0] == 'uploads' and p[1] in VELO_ACCESSORS]
-            layout = 'Velociraptor uploads (auto/ntfs/file/ntfs_vss)'
-        else:
-            selected = [(i, p) for i, p in entries if len(p) >= 2 and re.fullmatch(r'[A-Za-z]', p[0])]
-            layout = 'KAPE drive folders'
-        if not selected:
-            raise ValueError('No supported KAPE drive folders or Velociraptor uploads found')
-        seen = set()
-        for info, parts in selected:
-            key = '/'.join(parts)
-            if key in seen and not info.is_dir():
-                raise ValueError(f'Duplicate ZIP member: {key!r}')
-            seen.add(key)
-        indexes = sparse_uploads(z, selected) if has_velo and 'uploads.json' in z.namelist() else []
-        # 7-Zip supports Deflate64 (ZIP method 9), used by some KAPE
-        # archives. All members have been checked before invoking it.
-        if any(i.compress_type == 9 for i, _ in selected):
-            roots = sorted({'/'.join(p[:2]) if has_velo else p[0] for _, p in selected})
-            includes = ['-i!' + root + '/*' for root in roots]
-            command('7z', 'x', '-y', '-bd', '-bso0', '-bsp0', '-o' + str(dest), *includes, archive)
-        else:
+        if any(info.flag_bits & 1 for info, _ in entries):
+            names = [info.filename for info, _ in entries if not info.is_dir()]
+            if len(names) != len(set(names)):
+                raise ValueError('Encrypted ZIP contains duplicate member paths')
+            with tempfile.TemporaryDirectory(prefix='encrypted-', dir=dest.parent) as temp:
+                decrypted = Path(temp)
+                decrypt_archive(archive, decrypted)
+                return extract_collection(DirectoryArchive(decrypted), dest, source_dir=decrypted)
+        return extract_collection(z, dest, archive=archive)
+
+
+class CollectionView:
+    """Expose paths relative to the detected collection root."""
+    def __init__(self, archive, entries, prefix):
+        self.archive = archive
+        self.entries = []
+        self.original = {}
+        for info, parts in entries:
+            if parts[:len(prefix)] != prefix or len(parts) <= len(prefix):
+                continue
+            relative = parts[len(prefix):]
+            item = copy.copy(info)
+            item.filename = '/'.join(relative) + ('/' if info.is_dir() else '')
+            self.entries.append((item, relative))
+            if item.filename in self.original and not info.is_dir():
+                raise ValueError(f'Duplicate ZIP member: {info.filename!r}')
+            self.original[item.filename] = info
+
+    def namelist(self):
+        return [item.filename for item, _ in self.entries]
+
+    def open(self, item):
+        name = item.filename if isinstance(item, zipfile.ZipInfo) else item
+        return self.archive.open(self.original[name])
+
+
+def collection_root(entries):
+    """Find a single collection root from uploads or drive-root MFTs."""
+    velo_roots = set()
+    kape_roots = set()
+    for info, parts in entries:
+        for index in range(len(parts) - 2):
+            if parts[index] == 'uploads' and parts[index + 1] in VELO_ACCESSORS:
+                velo_roots.add(parts[:index])
+        if not info.is_dir() and len(parts) >= 2 and parts[-1].lower() == '$mft' and re.fullmatch(r'[A-Za-z]', parts[-2]):
+            kape_roots.add(parts[:-2])
+    # A drive-like component inside a Velociraptor upload is not a KAPE root.
+    kape_roots = {root for root in kape_roots if not any(root[:len(v) + 1] == v + ('uploads',) for v in velo_roots)}
+    # Ignore drive-like paths within an already identified KAPE drive.
+    kape_roots = {root for root in kape_roots if not any(
+        len(root) > len(other) and root[:len(other)] == other and re.fullmatch(r'[A-Za-z]', root[len(other)])
+        for other in kape_roots)}
+    roots = {('velociraptor', root) for root in velo_roots} | {('kape', root) for root in kape_roots}
+    if not roots:
+        raise ValueError('No $MFT at a KAPE drive root or supported Velociraptor uploads found')
+    if len(roots) != 1:
+        labels = sorted(f'{kind}: {"/".join(root) or "."}' for kind, root in roots)
+        raise ValueError('Multiple collection roots found; separate collections before processing: ' + ', '.join(labels))
+    return next(iter(roots))
+
+
+def extract_collection(z, dest, archive=None, source_dir=None):
+    entries = [(info, member_path(info)) for info in z.infolist()]
+    kind, prefix = collection_root(entries)
+    view = CollectionView(z, entries, prefix)
+    entries = view.entries
+    has_velo = kind == 'velociraptor'
+    if prefix:
+        log(f'Collection root: {"/".join(prefix)}')
+    if has_velo:
+        selected = [(i, p) for i, p in entries if len(p) >= 3 and p[0] == 'uploads' and p[1] in VELO_ACCESSORS]
+        layout = 'Velociraptor uploads (auto/ntfs/file/ntfs_vss)'
+    else:
+        selected = [(i, p) for i, p in entries if len(p) >= 2 and re.fullmatch(r'[A-Za-z]', p[0])]
+        layout = 'KAPE drive folders'
+    if not selected:
+        raise ValueError('No supported KAPE drive folders or Velociraptor uploads found')
+    seen = set()
+    for info, parts in selected:
+        key = '/'.join(parts)
+        if key in seen and not info.is_dir():
+            raise ValueError(f'Duplicate ZIP member: {key!r}')
+        seen.add(key)
+    indexes = sparse_uploads(view, selected) if has_velo and 'uploads.json' in view.namelist() else []
+    # 7-Zip supports Deflate64 (ZIP method 9), used by some KAPE
+    # archives. All members have been checked before invoking it.
+    if archive is not None and any(i.compress_type == 9 for i, _ in selected):
+        roots = sorted({'/'.join(prefix + (p[:2] if has_velo else p[:1])) for _, p in selected})
+        includes = ['-i!' + root + '/*' for root in roots]
+        with tempfile.TemporaryDirectory(prefix='7z-', dir=dest.parent) as temp:
+            scratch = Path(temp)
+            command('7z', 'x', '-y', '-bd', '-bso0', '-bsp0', '-o' + str(scratch), *includes, archive)
             for info, parts in selected:
                 target = dest.joinpath(*parts)
                 if info.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with z.open(info) as src, target.open('xb') as dst:
+                    shutil.move(str(scratch.joinpath(*prefix, *parts)), target)
+    else:
+        for info, parts in selected:
+            target = dest.joinpath(*parts)
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source_dir is not None:
+                    shutil.copy2(source_dir.joinpath(*prefix, *parts), target)
+                else:
+                    with view.open(info) as src, target.open('xb') as dst:
                         shutil.copyfileobj(src, dst, 1024 * 1024)
-        sparse_warnings = []
-        for data_parts, index_parts in indexes:
-            sparse_warnings.extend(restore_sparse_file(dest.joinpath(*data_parts), dest.joinpath(*index_parts), '/'.join(index_parts)))
-            dest.joinpath(*index_parts).unlink()
-        index_paths = {index_parts for _, index_parts in indexes}
-        selected = [(i, p) for i, p in selected if p not in index_paths]
-        normalization = normalize_velociraptor(z, selected, dest) if has_velo else []
-        if indexes:
-            summary = f'Velociraptor sparse files reconstructed: {len(indexes)}'
-            log(summary)
-            normalization.append(summary)
-        for warning in sparse_warnings:
-            log(warning)
-            normalization.append(warning)
-        mfts = [dest.joinpath(*p) for i, p in selected if not i.is_dir() and p[-1].lower() == '$mft']
-        log(f'Layout: {layout}; extracted {sum(not i.is_dir() for i, _ in selected)} files; MFTs: {len(mfts)}')
-        if not mfts:
-            raise ValueError('No $MFT was found in the selected evidence; cannot create the requested MFT timeline')
-        return mfts, normalization
+    sparse_warnings = []
+    for data_parts, index_parts in indexes:
+        sparse_warnings.extend(restore_sparse_file(dest.joinpath(*data_parts), dest.joinpath(*index_parts), '/'.join(index_parts)))
+        dest.joinpath(*index_parts).unlink()
+    index_paths = {index_parts for _, index_parts in indexes}
+    selected = [(i, p) for i, p in selected if p not in index_paths]
+    normalization = normalize_velociraptor(view, selected, dest) if has_velo else []
+    if prefix:
+        normalization.insert(0, f'Collection root within input: {"/".join(prefix)}')
+    if indexes:
+        summary = f'Velociraptor sparse files reconstructed: {len(indexes)}'
+        log(summary)
+        normalization.append(summary)
+    for warning in sparse_warnings:
+        log(warning)
+        normalization.append(warning)
+    mfts = [dest.joinpath(*p) for i, p in selected if not i.is_dir() and p[-1].lower() == '$mft']
+    log(f'Layout: {layout}; extracted {sum(not i.is_dir() for i, _ in selected)} files; MFTs: {len(mfts)}')
+    if not mfts:
+        raise ValueError('No $MFT was found in the selected evidence; cannot create the requested MFT timeline')
+    return mfts, normalization
 
 
 def drive_letter(mft, root):
@@ -648,8 +794,8 @@ def publish_outputs(pairs):
 
 def export_name(source, window):
     """Keep image output names stable and distinguish Plaso re-export windows."""
-    name = source.stem + '-supertimeline'
-    if source.suffix.lower() != '.plaso':
+    name = (source.name if source.is_dir() else source.stem) + '-supertimeline'
+    if source.is_dir() or source.suffix.lower() != '.plaso':
         return name
     if window is None:
         return name + '-all-time'
@@ -710,18 +856,19 @@ def process_plaso(source, window, filters_enabled, event_filter, include_duplica
 
 
 def process(archive, timezone, window, workers, filters_enabled=True, event_filter=None, image_drive_letter='C', include_vss=False, include_duplicates=False):
-    disk_image = archive.suffix.lower() in ('.e01', '.dd', '.img', '.raw')
+    disk_image = archive.is_file() and archive.suffix.lower() in ('.e01', '.dd', '.img', '.raw')
     if include_vss and not disk_image:
         log('--include-vss applies only to E01/raw disk images; this input uses its existing processing path')
     if filters_enabled and event_filter is None:
         event_filter = load_event_filter()
-    if archive.suffix.lower() == '.plaso':
+    if archive.is_file() and archive.suffix.lower() == '.plaso':
         return process_plaso(archive, window, filters_enabled, event_filter, include_duplicates)
-    output = OUTPUT / (archive.stem + '-supertimeline.csv')
-    report = OUTPUT / (archive.stem + '-plaso-warnings.txt')
+    name = archive.name if archive.is_dir() else archive.stem
+    output = OUTPUT / (name + '-supertimeline.csv')
+    report = OUTPUT / (name + '-plaso-warnings.txt')
     plaso_dir = OUTPUT / 'plaso'
     plaso_dir.mkdir(exist_ok=True)
-    plaso_output = plaso_dir / (archive.stem + '.plaso')
+    plaso_output = plaso_dir / (name + '.plaso')
     for target in (output, report, plaso_output):
         if target.exists():
             raise FileExistsError(f'Output already exists: {target}')
@@ -733,7 +880,7 @@ def process(archive, timezone, window, workers, filters_enabled=True, event_filt
         if disk_image:
             from disk_reader import prepare_disk
             mfts, normalization, partition, is_ntfs = prepare_disk(archive, evidence, image_drive_letter, log)
-        elif archive.suffix.lower() == '.vhdx':
+        elif archive.is_file() and archive.suffix.lower() == '.vhdx':
             from vhdx_reader import extract_vhdx
             mfts, normalization = extract_vhdx(archive, evidence, log)
         else:
@@ -775,6 +922,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--timezone', help='IANA timezone of timestamps without timezone information (required for images)')
     parser.add_argument('--input-file', help=argparse.SUPPRESS)
+    parser.add_argument('--input-directory', help=argparse.SUPPRESS)
     parser.add_argument('--no-filter', '-nofilter', action='store_true', help='Disable MFT noise and CSV event-log filters')
     parser.add_argument('--include-vss', action='store_true',
                         help='Include available VSS snapshots in NTFS E01/raw images')
@@ -793,18 +941,27 @@ def main():
             parser.error(f'Unknown IANA timezone: {args.timezone}')
     window = None if args.all_time else (args.timewindow or default_window(dt.datetime.now(dt.timezone.utc)))
     log('Export window: ' + (f'{window[0].isoformat()} <= event time < {window[1].isoformat()} (UTC)' if window else 'all timestamps'))
+    if args.input_file and args.input_directory:
+        parser.error('Choose one input file or extracted directory')
     if args.input_file:
-        if Path(args.input_file).name != args.input_file or Path(args.input_file).suffix.lower() != '.plaso':
-            parser.error('Input file must be a .plaso filename within the input directory')
+        if Path(args.input_file).name != args.input_file or Path(args.input_file).suffix.lower() not in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw', '.plaso'):
+            parser.error('Input file must be a supported filename within the input directory')
         source = INPUT / args.input_file
         if not source.is_file():
             parser.error(f'Input file does not exist: {source}')
+        archives = [source]
+    elif args.input_directory:
+        if Path(args.input_directory).name != args.input_directory or args.input_directory in ('.', '..'):
+            parser.error('Invalid input directory name')
+        source = INPUT / args.input_directory
+        if not source.is_dir():
+            parser.error(f'Input directory does not exist: {source}')
         archives = [source]
     else:
         archives = sorted((p for p in INPUT.iterdir() if p.is_file() and p.suffix.lower() in ('.zip', '.vhdx', '.e01', '.dd', '.img', '.raw', '.plaso')), key=lambda p: p.name)
     if not archives:
         parser.error('No supported ZIP, VHDX, E01, raw image or Plaso files found in the input folder')
-    if not args.timezone and any(a.suffix.lower() != '.plaso' for a in archives):
+    if not args.timezone and any(a.is_dir() or a.suffix.lower() != '.plaso' for a in archives):
         parser.error('--timezone is required when processing images')
     try:
         event_filter = None if args.no_filter else load_event_filter()
